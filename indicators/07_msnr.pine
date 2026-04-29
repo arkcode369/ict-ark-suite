@@ -21,10 +21,10 @@
 //   - Bullish / Bearish Engulfing candles
 //   - QML reversal levels (basic detector)
 //
-// NOT in v0.1 (see ROADMAP):
-//   - HNS (Head & Shoulders) full pattern matching
-//   - Multi-trendline auto-fit (body-based)
-//   - Storyline+Roadblocks visual narrative
+// v0.2 additions:
+//   - HNS (Head & Shoulders) full pattern matcher (regular + inverse)
+//   - Multi-trendline auto-fit (body-based, 3+ pivots)
+//   - Storyline / Roadblocks ranking (classify S/R as active obstacles)
 //
 // Repaint policy: S/R levels stable once cluster confirms; cluster never
 //   re-fires retroactively. Engulfing settled on close. QML settled after
@@ -46,6 +46,9 @@ indicator(
 G_SR    = "Body-based S/R"
 G_ENG   = "Engulfing"
 G_QML   = "QML (Quasimodo Level)"
+G_HNS   = "HNS (Head & Shoulders)"
+G_TL    = "Multi-trendline"
+G_STO   = "Storyline / Roadblocks"
 G_DISP  = "Display"
 G_ALERT = "Alerts"
 
@@ -84,6 +87,41 @@ maxBars = input.int(2000, "Limit drawings to last N bars (0 = no limit)",
 alertSR  = input.bool(true, "Alert when S/R level forms",  group = G_ALERT)
 alertEng = input.bool(true, "Alert on engulfing candle",   group = G_ALERT)
 alertQML = input.bool(true, "Alert on QML formation",      group = G_ALERT)
+alertHNS = input.bool(true, "Alert on HNS neckline break", group = G_ALERT)
+
+// --- HNS ---
+showHNS    = input.bool(true,  "Show HNS / Inverse HNS", group = G_HNS)
+hnsTol     = input.float(0.4,
+                  "Shoulder symmetry tolerance (× head height)",
+                  minval = 0.05, maxval = 1.0, step = 0.05, group = G_HNS)
+hnsMinHeight = input.float(0.3,
+                  "Min head height (× ATR14)",
+                  minval = 0.1, maxval = 5.0, step = 0.1, group = G_HNS)
+maxHNS     = input.int(8, "Max HNS patterns kept",
+                  minval = 1, maxval = 30, group = G_HNS)
+colHNSBear = input.color(color.new(color.red,    20), "HNS bear", group = G_HNS, inline = "hns")
+colHNSBull = input.color(color.new(color.green,  20), "HNS bull", group = G_HNS, inline = "hns")
+
+// --- Multi-trendline ---
+showTL    = input.bool(true,  "Show body-based trendlines", group = G_TL)
+tlPivots  = input.int(3, "Min pivots to confirm trendline",
+                  minval = 2, maxval = 6, group = G_TL)
+tlLookback = input.int(60, "Pivot lookback bars",
+                  minval = 20, maxval = 300, group = G_TL)
+tlPivotLB  = input.int(3, "Pivot half-width",
+                  minval = 2, maxval = 10, group = G_TL)
+maxTL      = input.int(4, "Max trendlines kept (each direction)",
+                  minval = 1, maxval = 10, group = G_TL)
+colTLDown  = input.color(color.new(color.red,    20), "Down TL", group = G_TL, inline = "tl")
+colTLUp    = input.color(color.new(color.lime,   20), "Up TL",   group = G_TL, inline = "tl")
+
+// --- Storyline / Roadblocks ---
+showSto      = input.bool(true,  "Highlight S/R as active roadblocks", group = G_STO)
+rbDistATR    = input.float(2.0,
+                  "Roadblock distance (× ATR14)",
+                  minval = 0.2, maxval = 10.0, step = 0.1, group = G_STO)
+rbFreshOnly  = input.bool(true,  "Only fresh levels qualify",        group = G_STO)
+colRoadblock = input.color(color.new(color.yellow, 0), "Roadblock highlight", group = G_STO)
 
 // =============================================================================
 // HELPERS
@@ -312,6 +350,298 @@ while array.size(qmls) > qmlMaxKept
         line.delete(q0.ln)
     if not na(q0.lb)
         label.delete(q0.lb)
+
+// =============================================================================
+// HNS / INVERSE HNS DETECTION
+// -----------------------------------------------------------------------------
+// Regular HNS (bearish):
+//   pivot1 = LS (left shoulder swing high)
+//   valley1 = swing low between LS and head
+//   pivot2 = head (higher swing high)
+//   valley2 = swing low between head and RS
+//   pivot3 = RS (lower swing high, similar height to LS within hnsTol × headHeight)
+//   neckline = line through valley1, valley2
+//   confirmation = close < neckline value at current bar
+//
+// Inverse HNS (bullish): mirror on lows.
+// =============================================================================
+
+type Hns
+    int   ls
+    int   head
+    int   rs
+    int   v1
+    int   v2
+    float lsP
+    float headP
+    float rsP
+    float v1P
+    float v2P
+    bool  bearish
+    bool  confirmed
+    line  neckLn
+    label lbl
+
+var array<Hns> hnsList = array.new<Hns>()
+
+// Track recent swing highs/lows (offset 3-pivots)
+var array<int>   recentHi   = array.new<int>()
+var array<float> recentHiP  = array.new<float>()
+var array<int>   recentLo   = array.new<int>()
+var array<float> recentLoP  = array.new<float>()
+
+if barstate.isconfirmed
+    if f_isPH(3)
+        array.push(recentHi,  bar_index - 3)
+        array.push(recentHiP, high[3])
+        if array.size(recentHi) > 20
+            array.shift(recentHi)
+            array.shift(recentHiP)
+    if f_isPL(3)
+        array.push(recentLo,  bar_index - 3)
+        array.push(recentLoP, low[3])
+        if array.size(recentLo) > 20
+            array.shift(recentLo)
+            array.shift(recentLoP)
+
+// Detect regular HNS (3 most recent highs + 2 most recent lows between)
+if showHNS and barstate.isconfirmed and array.size(recentHi) >= 3 and array.size(recentLo) >= 2
+    int n = array.size(recentHi)
+    float lsP   = array.get(recentHiP, n - 3)
+    float headP = array.get(recentHiP, n - 2)
+    float rsP   = array.get(recentHiP, n - 1)
+    int   lsB   = array.get(recentHi,  n - 3)
+    int   hdB   = array.get(recentHi,  n - 2)
+    int   rsB   = array.get(recentHi,  n - 1)
+    int   nl    = array.size(recentLo)
+    float v1P   = array.get(recentLoP, nl - 2)
+    float v2P   = array.get(recentLoP, nl - 1)
+    int   v1B   = array.get(recentLo,  nl - 2)
+    int   v2B   = array.get(recentLo,  nl - 1)
+    if v1B > lsB and v1B < hdB and v2B > hdB and v2B < rsB
+        float headHeight = math.min(headP - lsP, headP - rsP)
+        bool isHigherHead = headP > lsP and headP > rsP
+        bool shoulderSym  = math.abs(lsP - rsP) <= hnsTol * headHeight
+        bool minHt        = headHeight >= hnsMinHeight * atrV
+        if isHigherHead and shoulderSym and minHt
+            // Already captured?
+            bool dup = false
+            if array.size(hnsList) > 0
+                Hns last = array.get(hnsList, array.size(hnsList) - 1)
+                if last.bearish and last.head == hdB and last.rs == rsB
+                    dup := true
+            if not dup
+                // Project neckline value at current bar
+                float slope = v2P - v1P
+                float run   = v2B - v1B
+                float necklineNow = run == 0 ? v2P : v2P + slope * (bar_index - v2B) / run
+                bool broken = close < necklineNow
+                if f_drawingAllowed()
+                    line ln = line.new(v1B, v1P, bar_index, necklineNow,
+                         color = colHNSBear,
+                         style = line.style_dashed,
+                         width = 2)
+                    label lb = label.new(rsB, rsP,
+                         "HNS" + (broken ? " ✓" : ""),
+                         color = color.new(colHNSBear, 60),
+                         textcolor = color.white,
+                         style = label.style_label_down,
+                         size = size.small)
+                    Hns h = Hns.new(lsB, hdB, rsB, v1B, v2B, lsP, headP, rsP, v1P, v2P,
+                                    true, broken, ln, lb)
+                    array.push(hnsList, h)
+                if broken and alertHNS
+                    alert("HNS confirmed @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+// Detect inverse HNS (3 most recent lows + 2 most recent highs between)
+if showHNS and barstate.isconfirmed and array.size(recentLo) >= 3 and array.size(recentHi) >= 2
+    int n = array.size(recentLo)
+    float lsP   = array.get(recentLoP, n - 3)
+    float headP = array.get(recentLoP, n - 2)
+    float rsP   = array.get(recentLoP, n - 1)
+    int   lsB   = array.get(recentLo,  n - 3)
+    int   hdB   = array.get(recentLo,  n - 2)
+    int   rsB   = array.get(recentLo,  n - 1)
+    int   nh    = array.size(recentHi)
+    float v1P   = array.get(recentHiP, nh - 2)
+    float v2P   = array.get(recentHiP, nh - 1)
+    int   v1B   = array.get(recentHi,  nh - 2)
+    int   v2B   = array.get(recentHi,  nh - 1)
+    if v1B > lsB and v1B < hdB and v2B > hdB and v2B < rsB
+        float headHeight = math.min(lsP - headP, rsP - headP)
+        bool isLowerHead = headP < lsP and headP < rsP
+        bool shoulderSym = math.abs(lsP - rsP) <= hnsTol * headHeight
+        bool minHt       = headHeight >= hnsMinHeight * atrV
+        if isLowerHead and shoulderSym and minHt
+            bool dup = false
+            if array.size(hnsList) > 0
+                Hns last = array.get(hnsList, array.size(hnsList) - 1)
+                if not last.bearish and last.head == hdB and last.rs == rsB
+                    dup := true
+            if not dup
+                float slope = v2P - v1P
+                float run   = v2B - v1B
+                float necklineNow = run == 0 ? v2P : v2P + slope * (bar_index - v2B) / run
+                bool broken = close > necklineNow
+                if f_drawingAllowed()
+                    line ln = line.new(v1B, v1P, bar_index, necklineNow,
+                         color = colHNSBull,
+                         style = line.style_dashed,
+                         width = 2)
+                    label lb = label.new(rsB, rsP,
+                         "iHNS" + (broken ? " ✓" : ""),
+                         color = color.new(colHNSBull, 60),
+                         textcolor = color.white,
+                         style = label.style_label_up,
+                         size = size.small)
+                    Hns h = Hns.new(lsB, hdB, rsB, v1B, v2B, lsP, headP, rsP, v1P, v2P,
+                                    false, broken, ln, lb)
+                    array.push(hnsList, h)
+                if broken and alertHNS
+                    alert("Inverse HNS confirmed @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+while array.size(hnsList) > maxHNS
+    Hns h0 = array.shift(hnsList)
+    if not na(h0.neckLn)
+        line.delete(h0.neckLn)
+    if not na(h0.lbl)
+        label.delete(h0.lbl)
+
+// =============================================================================
+// MULTI-TRENDLINE AUTO-FIT
+// -----------------------------------------------------------------------------
+// Collect last N body pivots (body-high for downtrend, body-low for uptrend),
+// fit a line through 3+ that all sit on the same side: descending series
+// for downtrend, ascending for uptrend. Use simple greedy: take oldest pivot,
+// pair with newest, check if intermediate pivots also fit within ATR/2.
+// =============================================================================
+
+type Tl
+    int   bar1
+    int   bar2
+    float p1
+    float p2
+    bool  isDown
+    line  ln
+
+var array<Tl> tls = array.new<Tl>()
+
+// We re-detect every N bars to avoid over-drawing; here we redetect on every
+// confirmed pivot.
+f_collectBodyPivots(bool wantHigh) =>
+    array<int>   bArr = array.new<int>()
+    array<float> pArr = array.new<float>()
+    for k = tlPivotLB to math.min(tlLookback, bar_index)
+        bool ok = true
+        for j = -tlPivotLB to tlPivotLB
+            if j != 0
+                int kk = k + j
+                if kk >= 0
+                    if wantHigh
+                        if f_bodyHigh()[kk] > f_bodyHigh()[k]
+                            ok := false
+                            break
+                    else
+                        if f_bodyLow()[kk] < f_bodyLow()[k]
+                            ok := false
+                            break
+        if ok
+            array.push(bArr, bar_index - k)
+            array.push(pArr, wantHigh ? f_bodyHigh()[k] : f_bodyLow()[k])
+    [bArr, pArr]
+
+if showTL and barstate.isconfirmed and bar_index > tlLookback
+    [hiBars, hiPrices] = f_collectBodyPivots(true)
+    [loBars, loPrices] = f_collectBodyPivots(false)
+    // Downtrend: pair oldest hi with most recent hi where price is lower
+    if array.size(hiBars) >= tlPivots
+        // Use first (oldest) and last (newest) pivots in window
+        int b1 = array.get(hiBars, 0)
+        int b2 = array.get(hiBars, array.size(hiBars) - 1)
+        float p1 = array.get(hiPrices, 0)
+        float p2 = array.get(hiPrices, array.size(hiPrices) - 1)
+        if p2 < p1 and b2 > b1
+            // Verify intermediate pivots fit (within tolerance)
+            float slope = (p2 - p1) / float(b2 - b1)
+            int ok = 0
+            int total = array.size(hiBars)
+            for kk = 0 to total - 1
+                int bb = array.get(hiBars, kk)
+                float pp = array.get(hiPrices, kk)
+                float lineP = p1 + slope * (bb - b1)
+                if math.abs(pp - lineP) <= atrV * 0.5
+                    ok += 1
+            if ok >= tlPivots
+                bool dup = false
+                if array.size(tls) > 0
+                    for kk = 0 to array.size(tls) - 1
+                        Tl t = array.get(tls, kk)
+                        if t.isDown and t.bar1 == b1 and t.bar2 == b2
+                            dup := true
+                            break
+                if not dup and f_drawingAllowed()
+                    line ln = line.new(b1, p1, b2, p2,
+                         color = colTLDown,
+                         style = line.style_solid,
+                         width = 2,
+                         extend = extend.right)
+                    array.push(tls, Tl.new(b1, b2, p1, p2, true, ln))
+    if array.size(loBars) >= tlPivots
+        int b1 = array.get(loBars, 0)
+        int b2 = array.get(loBars, array.size(loBars) - 1)
+        float p1 = array.get(loPrices, 0)
+        float p2 = array.get(loPrices, array.size(loPrices) - 1)
+        if p2 > p1 and b2 > b1
+            float slope = (p2 - p1) / float(b2 - b1)
+            int ok = 0
+            int total = array.size(loBars)
+            for kk = 0 to total - 1
+                int bb = array.get(loBars, kk)
+                float pp = array.get(loPrices, kk)
+                float lineP = p1 + slope * (bb - b1)
+                if math.abs(pp - lineP) <= atrV * 0.5
+                    ok += 1
+            if ok >= tlPivots
+                bool dup = false
+                if array.size(tls) > 0
+                    for kk = 0 to array.size(tls) - 1
+                        Tl t = array.get(tls, kk)
+                        if not t.isDown and t.bar1 == b1 and t.bar2 == b2
+                            dup := true
+                            break
+                if not dup and f_drawingAllowed()
+                    line ln = line.new(b1, p1, b2, p2,
+                         color = colTLUp,
+                         style = line.style_solid,
+                         width = 2,
+                         extend = extend.right)
+                    array.push(tls, Tl.new(b1, b2, p1, p2, false, ln))
+
+// Prune: keep newest maxTL per direction
+while array.size(tls) > maxTL * 2
+    Tl t0 = array.shift(tls)
+    if not na(t0.ln)
+        line.delete(t0.ln)
+
+// =============================================================================
+// STORYLINE / ROADBLOCKS
+// -----------------------------------------------------------------------------
+// Walk active SR list; mark levels within rbDistATR × ATR14 of current close
+// as "active roadblocks" (line width bumped + label highlighted).
+// =============================================================================
+
+if showSto and barstate.isconfirmed and array.size(srList) > 0
+    for k = 0 to array.size(srList) - 1
+        SR s = array.get(srList, k)
+        bool nearby = math.abs(close - s.price) <= rbDistATR * atrV
+        bool qualifies = nearby and (rbFreshOnly ? s.fresh : true) and not s.flipped
+        if qualifies
+            if not na(s.ln)
+                line.set_width(s.ln, 3)
+                line.set_color(s.ln, colRoadblock)
+            if not na(s.lb)
+                label.set_text(s.lb, (s.resistance ? "R★" : "S★") + " ROADBLOCK")
+                label.set_color(s.lb, color.new(colRoadblock, 30))
 
 // =============================================================================
 // ALERT CONDITIONS
