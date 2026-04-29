@@ -1,0 +1,325 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | Malaysian SNR (Body-based S/R)
+// -----------------------------------------------------------------------------
+// File:        indicators/07_msnr.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concepts:    docs/concepts/concept-snr.md
+//                - Body-based Support / Resistance (wicks ignored)
+//                - Classical / Breakout / GAP S/R
+//                - Fresh vs Unfresh (untested vs tested)
+//                - Bullish / Bearish Engulfing
+//                - QML (Quasimodo Level) — 3-bar reversal pattern
+//                - Trendline approach (body-based)
+//                - Storyline + Roadblocks logic
+//
+// Detected:
+//   - Body-cluster S/R: groups of recent body extremes within ATR tolerance
+//   - Fresh / Unfresh classification
+//   - Broken level becomes opposite (Resistance → Support and vice versa)
+//   - Bullish / Bearish Engulfing candles
+//   - QML reversal levels (basic detector)
+//
+// NOT in v0.1 (see ROADMAP):
+//   - HNS (Head & Shoulders) full pattern matching
+//   - Multi-trendline auto-fit (body-based)
+//   - Storyline+Roadblocks visual narrative
+//
+// Repaint policy: S/R levels stable once cluster confirms; cluster never
+//   re-fires retroactively. Engulfing settled on close. QML settled after
+//   3rd bar.
+// =============================================================================
+
+indicator(
+     "ICT/SMC Suite | Malaysian SNR",
+     shorttitle = "ICT-MSNR",
+     overlay = true,
+     max_lines_count = 500,
+     max_labels_count = 500
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_SR    = "Body-based S/R"
+G_ENG   = "Engulfing"
+G_QML   = "QML (Quasimodo Level)"
+G_DISP  = "Display"
+G_ALERT = "Alerts"
+
+showSR        = input.bool(true, "Show body-cluster S/R lines", group = G_SR)
+clusterCount  = input.int(2,
+                  "Min body-extreme cluster size",
+                  minval = 2, maxval = 5, group = G_SR)
+clusterTolATR = input.float(0.25,
+                  "Cluster tolerance (× ATR14)",
+                  minval = 0.05, maxval = 2.0, step = 0.05, group = G_SR)
+srLookback    = input.int(40,
+                  "Body lookback bars",
+                  minval = 10, maxval = 200, group = G_SR)
+maxSRLines    = input.int(20, "Max S/R lines kept", minval = 5, maxval = 100, group = G_SR)
+
+colSup = input.color(color.new(color.lime, 0), "Support",    group = G_SR, inline = "src")
+colRes = input.color(color.new(color.red,  0), "Resistance", group = G_SR, inline = "src")
+colBrk = input.color(color.new(color.gray, 30), "Broken (flipped)", group = G_SR)
+
+showEng    = input.bool(true, "Show engulfing markers", group = G_ENG)
+engStrong  = input.float(0.0,
+                  "Min engulf body ratio (current/prev)",
+                  minval = 0.5, maxval = 5.0, step = 0.1,
+                  group = G_ENG)
+colEngBull = input.color(color.new(color.green, 0), "Bull engulf", group = G_ENG, inline = "eng")
+colEngBear = input.color(color.new(color.red,   0), "Bear engulf", group = G_ENG, inline = "eng")
+
+showQML = input.bool(true, "Show QML reversal levels", group = G_QML)
+qmlMaxKept = input.int(15, "Max QML lines kept", minval = 3, maxval = 50, group = G_QML)
+colQMLBull = input.color(color.new(color.aqua,    0), "QML bull", group = G_QML, inline = "qml")
+colQMLBear = input.color(color.new(color.fuchsia, 0), "QML bear", group = G_QML, inline = "qml")
+
+maxBars = input.int(2000, "Limit drawings to last N bars (0 = no limit)",
+                    minval = 0, maxval = 20000, group = G_DISP)
+
+alertSR  = input.bool(true, "Alert when S/R level forms",  group = G_ALERT)
+alertEng = input.bool(true, "Alert on engulfing candle",   group = G_ALERT)
+alertQML = input.bool(true, "Alert on QML formation",      group = G_ALERT)
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+f_drawingAllowed() => maxBars == 0 or bar_index >= last_bar_index - maxBars
+atrV = ta.atr(14)
+
+f_bodyHigh() => math.max(open, close)
+f_bodyLow()  => math.min(open, close)
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+type SR
+    float price
+    int   bar
+    bool  resistance      // true = R, false = S
+    bool  fresh          = true
+    bool  flipped        = false
+    line  ln
+    label lb
+
+var array<SR> srList = array.new<SR>()
+
+// =============================================================================
+// BODY CLUSTER S/R DETECTION
+// -----------------------------------------------------------------------------
+// Look back srLookback bars; find tops (body-high) that have ≥ clusterCount
+// occurrences within clusterTolATR × ATR. Same for body-low (support).
+// Drawn at the median of cluster.
+// =============================================================================
+
+f_findCluster(bool wantHighs) =>
+    float tol = clusterTolATR * atrV
+    int   bestCount = 0
+    float bestPrice = na
+    int   bestBar   = na
+    for i = 2 to srLookback
+        float anchor = wantHighs ? f_bodyHigh()[i] : f_bodyLow()[i]
+        int   cnt    = 1
+        float sum    = anchor
+        for j = 2 to srLookback
+            if j != i
+                float p = wantHighs ? f_bodyHigh()[j] : f_bodyLow()[j]
+                if math.abs(p - anchor) <= tol
+                    cnt += 1
+                    sum += p
+        if cnt > bestCount and cnt >= clusterCount
+            bestCount := cnt
+            bestPrice := sum / cnt
+            bestBar   := bar_index - i
+    [bestPrice, bestBar, bestCount]
+
+f_levelExists(float price, float tol) =>
+    bool exists = false
+    if array.size(srList) > 0
+        for k = 0 to array.size(srList) - 1
+            SR s = array.get(srList, k)
+            if math.abs(s.price - price) <= tol
+                exists := true
+                break
+    exists
+
+f_addSR(float price, int barAt, bool isRes) =>
+    if not f_levelExists(price, clusterTolATR * atrV)
+        color cc = isRes ? colRes : colSup
+        line ln = line.new(barAt, price, bar_index, price,
+             color = cc,
+             style = line.style_solid,
+             width = 1,
+             extend = extend.right)
+        label lb = label.new(bar_index, price,
+             (isRes ? "R" : "S") + " (fresh)",
+             color = color.new(cc, 80),
+             textcolor = cc,
+             style = label.style_label_left,
+             size = size.tiny)
+        SR s = SR.new(price, barAt, isRes, true, false, ln, lb)
+        array.push(srList, s)
+        if alertSR
+            alert((isRes ? "Resistance" : "Support") + " formed @ " +
+                  str.tostring(price), alert.freq_once_per_bar_close)
+        while array.size(srList) > maxSRLines
+            SR s0 = array.shift(srList)
+            if not na(s0.ln)
+                line.delete(s0.ln)
+            if not na(s0.lb)
+                label.delete(s0.lb)
+
+if showSR and barstate.isconfirmed and bar_index > srLookback
+    [resPrice, resBar, resCnt] = f_findCluster(true)
+    [supPrice, supBar, supCnt] = f_findCluster(false)
+    if not na(resPrice) and resCnt >= clusterCount
+        f_addSR(resPrice, resBar, true)
+    if not na(supPrice) and supCnt >= clusterCount
+        f_addSR(supPrice, supBar, false)
+
+// Update fresh/unfresh + flipped state for all S/R lines
+if barstate.isconfirmed and array.size(srList) > 0
+    for k = 0 to array.size(srList) - 1
+        SR s = array.get(srList, k)
+        if not s.flipped
+            // Fresh check: body crossed level
+            if s.resistance
+                if f_bodyHigh() > s.price
+                    s.flipped := true
+                    s.resistance := false
+                    if not na(s.ln)
+                        line.set_color(s.ln, colBrk)
+                    if not na(s.lb)
+                        label.set_text(s.lb, "S (flipped)")
+                else if s.fresh and high >= s.price
+                    s.fresh := false
+                    if not na(s.lb)
+                        label.set_text(s.lb, "R")
+            else
+                if f_bodyLow() < s.price
+                    s.flipped := true
+                    s.resistance := true
+                    if not na(s.ln)
+                        line.set_color(s.ln, colBrk)
+                    if not na(s.lb)
+                        label.set_text(s.lb, "R (flipped)")
+                else if s.fresh and low <= s.price
+                    s.fresh := false
+                    if not na(s.lb)
+                        label.set_text(s.lb, "S")
+        if not na(s.ln)
+            line.set_x2(s.ln, bar_index)
+        if not na(s.lb)
+            label.set_x(s.lb, bar_index)
+
+// =============================================================================
+// ENGULFING DETECTION
+// =============================================================================
+
+if showEng and barstate.isconfirmed
+    float prevBody = math.abs(close[1] - open[1])
+    float curBody  = math.abs(close - open)
+    bool minRatioOK = engStrong == 0.0 or curBody >= engStrong * prevBody
+    bool bullEng = close > open and close[1] < open[1] and
+                   close >= open[1] and open <= close[1] and minRatioOK
+    bool bearEng = close < open and close[1] > open[1] and
+                   close <= open[1] and open >= close[1] and minRatioOK
+    if (bullEng or bearEng) and f_drawingAllowed()
+        color cc = bullEng ? colEngBull : colEngBear
+        label.new(bar_index, bullEng ? low - atrV * 0.3 : high + atrV * 0.3,
+             bullEng ? "ENG↑" : "ENG↓",
+             color = color.new(cc, 30),
+             textcolor = color.white,
+             style = bullEng ? label.style_label_up : label.style_label_down,
+             size = size.tiny)
+        if alertEng
+            alert((bullEng ? "Bullish" : "Bearish") + " engulfing @ " + syminfo.ticker,
+                  alert.freq_once_per_bar_close)
+
+// =============================================================================
+// QML (Quasimodo Level) DETECTION
+// -----------------------------------------------------------------------------
+// Bullish QML setup (3-pivot pattern):
+//   pivot1 = swing low (anchor)
+//   pivot2 = swing high higher than prior
+//   pivot3 = swing low lower than pivot1 (Quasimodo break)
+// Reversal signal at pivot2 level.
+// =============================================================================
+
+type Qml
+    float price
+    int   bar
+    bool  bullish    // bullish QML (long entry off pivot2)
+    line  ln
+    label lb
+
+var array<Qml> qmls = array.new<Qml>()
+
+// Use 3-bar pivots for simplicity
+f_isPH(simple int lb) =>
+    bool ok = true
+    for i = 0 to lb * 2
+        if i != lb and high[i] > high[lb]
+            ok := false
+            break
+    ok
+
+f_isPL(simple int lb) =>
+    bool ok = true
+    for i = 0 to lb * 2
+        if i != lb and low[i] < low[lb]
+            ok := false
+            break
+    ok
+
+var float ph1 = na
+var float pl1 = na
+var float pl0 = na
+
+if barstate.isconfirmed
+    if f_isPL(3)
+        // Track sequence: pl0 (oldest) -> ph1 (middle) -> pl1 (newest, the Quasi break)
+        if not na(pl0) and not na(ph1) and low[3] < pl0
+            // Bullish QML: pivot2 = ph1 (the high between two lows)
+            if showQML and f_drawingAllowed()
+                line ln = line.new(bar_index - 3, ph1, bar_index, ph1,
+                     color = colQMLBull,
+                     style = line.style_dashed,
+                     extend = extend.right)
+                label lb = label.new(bar_index, ph1, "QML↑",
+                     color = color.new(colQMLBull, 70),
+                     textcolor = color.white,
+                     style = label.style_label_left,
+                     size = size.tiny)
+                Qml q = Qml.new(ph1, bar_index - 3, true, ln, lb)
+                array.push(qmls, q)
+                if alertQML
+                    alert("Bullish QML @ " + str.tostring(ph1), alert.freq_once_per_bar_close)
+        pl0 := pl1
+        pl1 := low[3]
+    if f_isPH(3)
+        ph1 := high[3]
+
+while array.size(qmls) > qmlMaxKept
+    Qml q0 = array.shift(qmls)
+    if not na(q0.ln)
+        line.delete(q0.ln)
+    if not na(q0.lb)
+        label.delete(q0.lb)
+
+// =============================================================================
+// ALERT CONDITIONS
+// =============================================================================
+
+alertcondition(barstate.isconfirmed and close > open and close[1] < open[1] and
+               close >= open[1] and open <= close[1],
+               "Bullish Engulfing", "Bull engulf @ {{ticker}}")
+alertcondition(barstate.isconfirmed and close < open and close[1] > open[1] and
+               close <= open[1] and open >= close[1],
+               "Bearish Engulfing", "Bear engulf @ {{ticker}}")
