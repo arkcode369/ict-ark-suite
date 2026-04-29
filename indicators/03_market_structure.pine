@@ -1,0 +1,315 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | Market Structure (Swings / BOS / MSS / CISD)
+// -----------------------------------------------------------------------------
+// File:        indicators/03_market_structure.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concepts:    docs/concepts/concept-logic.md
+//                - Advanced Market Structure
+//                - Market Structure Shift (MSS)
+//                - CISD (Change in State of Delivery)
+//              docs/concepts/concept-foundation-model.md
+//                - Protected Swings (TTrades)
+//                - CISD entry logic
+//              docs/concepts/concept-turtle-soup.md
+//                - 3-bar swing logic, CSD, internal vs external structure
+//
+// Detected:
+//   - Confirmed swing highs/lows (3-bar fractal, configurable lookback)
+//   - HH / HL / LH / LL labels (relative to last opposite swing)
+//   - BOS (Break of Structure): breaking the prior swing in current trend dir
+//   - MSS (Market Structure Shift): breaking the prior swing AGAINST current
+//     trend dir → trend flip (a.k.a. Change of Character / ChoCH)
+//   - CISD (Change in State of Delivery): close above last bearish open in a
+//     downtrend (bullish CISD), or close below last bullish open in an uptrend
+//     (bearish CISD)
+//
+// Repaint policy:
+//   - Swing detection: confirms `lookback` bars after candidate; never
+//     re-paints once confirmed.
+//   - BOS / MSS: detected on the close that breaks; never repaints.
+//   - CISD: detected on close; never repaints.
+// =============================================================================
+
+indicator(
+     "ICT/SMC Suite | Market Structure",
+     shorttitle = "ICT-MS",
+     overlay = true,
+     max_lines_count = 500,
+     max_labels_count = 500
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_DISP    = "Display"
+G_SWING   = "Swings"
+G_STRUCT  = "BOS / MSS"
+G_CISD    = "CISD"
+G_ALERT   = "Alerts"
+
+showSwingLabels = input.bool(true,  "Show HH / HL / LH / LL labels", group = G_DISP)
+showBOS         = input.bool(true,  "Show BOS lines",                group = G_DISP)
+showMSS         = input.bool(true,  "Show MSS lines",                group = G_DISP)
+showCISD        = input.bool(true,  "Show CISD markers",             group = G_DISP)
+
+colHH   = input.color(color.new(color.green,    0), "HH color",  group = G_DISP, inline = "swh")
+colLH   = input.color(color.new(color.red,      0), "LH color",  group = G_DISP, inline = "swh")
+colHL   = input.color(color.new(color.lime,     0), "HL color",  group = G_DISP, inline = "swl")
+colLL   = input.color(color.new(color.maroon,   0), "LL color",  group = G_DISP, inline = "swl")
+colBOS  = input.color(color.new(color.blue,    20), "BOS line",  group = G_DISP)
+colMSS  = input.color(color.new(color.fuchsia, 10), "MSS line",  group = G_DISP)
+colCISD = input.color(color.new(color.yellow,   0), "CISD",      group = G_DISP)
+
+// --- Swings ---
+swingLB = input.int(3, "Swing lookback (3-bar fractal half-width)",
+                    minval = 2, maxval = 30, group = G_SWING)
+maxSwings = input.int(50, "Max swings remembered (each side)",
+                      minval = 5, maxval = 200, group = G_SWING)
+
+// --- BOS / MSS ---
+breakRule = input.string("close",
+                  "Structure break rule",
+                  options = ["close", "wick"], group = G_STRUCT)
+
+// --- CISD ---
+cisdSourceCount = input.int(3,
+                  "CISD: scan back N opposing candles",
+                  minval = 1, maxval = 10, group = G_CISD)
+
+// --- Alerts ---
+alertBOS  = input.bool(true, "Alert on BOS",  group = G_ALERT)
+alertMSS  = input.bool(true, "Alert on MSS",  group = G_ALERT)
+alertCISD = input.bool(true, "Alert on CISD", group = G_ALERT)
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+type Swing
+    float price
+    int   bar
+    bool  isHigh
+    string tag       = ""    // "HH" | "HL" | "LH" | "LL"
+    bool  broken     = false
+    label lb         = na
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+f_isSwingHigh(simple int lb) =>
+    bool result = true
+    float candidate = high[lb]
+    for i = 0 to lb * 2
+        if i != lb and high[i] > candidate
+            result := false
+            break
+    result
+
+f_isSwingLow(simple int lb) =>
+    bool result = true
+    float candidate = low[lb]
+    for i = 0 to lb * 2
+        if i != lb and low[i] < candidate
+            result := false
+            break
+    result
+
+f_swingTag(Swing s, Swing prevSame) =>
+    string t = s.tag
+    if not na(prevSame)
+        if s.isHigh
+            t := s.price > prevSame.price ? "HH" : "LH"
+        else
+            t := s.price < prevSame.price ? "LL" : "HL"
+    else
+        t := s.isHigh ? "HH" : "LL"
+    t
+
+f_swingColor(string tag) =>
+    switch tag
+        "HH" => colHH
+        "LH" => colLH
+        "HL" => colHL
+        "LL" => colLL
+        =>      color.gray
+
+// =============================================================================
+// STATE
+// =============================================================================
+
+var array<Swing> highs = array.new<Swing>()
+var array<Swing> lows  = array.new<Swing>()
+
+// trendDir: 1 = up (last MSS bullish), -1 = down (last MSS bearish), 0 = none
+var int trendDir = 0
+
+// =============================================================================
+// SWING DETECTION & TAGGING
+// =============================================================================
+
+if barstate.isconfirmed
+    if f_isSwingHigh(swingLB)
+        Swing prevH = array.size(highs) > 0 ? array.get(highs, array.size(highs) - 1) : na
+        Swing s = Swing.new(high[swingLB], bar_index - swingLB, true)
+        s.tag := f_swingTag(s, prevH)
+        if showSwingLabels
+            color c = f_swingColor(s.tag)
+            s.lb := label.new(s.bar, s.price, s.tag,
+                 color = color.new(c, 80),
+                 textcolor = c,
+                 style = label.style_label_down,
+                 size = size.tiny)
+        array.push(highs, s)
+        while array.size(highs) > maxSwings
+            Swing s0 = array.shift(highs)
+            if not na(s0.lb)
+                label.delete(s0.lb)
+
+    if f_isSwingLow(swingLB)
+        Swing prevL = array.size(lows) > 0 ? array.get(lows, array.size(lows) - 1) : na
+        Swing s = Swing.new(low[swingLB], bar_index - swingLB, false)
+        s.tag := f_swingTag(s, prevL)
+        if showSwingLabels
+            color c = f_swingColor(s.tag)
+            s.lb := label.new(s.bar, s.price, s.tag,
+                 color = color.new(c, 80),
+                 textcolor = c,
+                 style = label.style_label_up,
+                 size = size.tiny)
+        array.push(lows, s)
+        while array.size(lows) > maxSwings
+            Swing s0 = array.shift(lows)
+            if not na(s0.lb)
+                label.delete(s0.lb)
+
+// =============================================================================
+// BOS / MSS DETECTION
+// =============================================================================
+
+f_priceBreaksUp(float lvl) =>
+    breakRule == "close" ? close > lvl : high > lvl
+
+f_priceBreaksDown(float lvl) =>
+    breakRule == "close" ? close < lvl : low < lvl
+
+// Walk highs/lows; the most recent UNBROKEN swing in trend direction is the
+// "structure point" for BOS detection. The most recent unbroken swing AGAINST
+// trend direction is the structure point for MSS detection.
+
+// Helper: get most-recent unbroken swing (high or low)
+f_mostRecentUnbroken(array<Swing> arr) =>
+    Swing res = na
+    int n = array.size(arr)
+    for k = 0 to n - 1
+        int i = n - 1 - k
+        if i < 0 or i >= n
+            break
+        Swing s = array.get(arr, i)
+        if not s.broken
+            res := s
+            break
+    res
+
+if barstate.isconfirmed
+    Swing latestHigh = f_mostRecentUnbroken(highs)
+    Swing latestLow  = f_mostRecentUnbroken(lows)
+
+    // Bullish break: close > latestHigh.price
+    if not na(latestHigh) and f_priceBreaksUp(latestHigh.price)
+        latestHigh.broken := true
+        bool isMSS = trendDir <= 0
+        trendDir := 1
+        color c = isMSS ? colMSS : colBOS
+        string tag = isMSS ? "MSS" : "BOS"
+        if (isMSS and showMSS) or (not isMSS and showBOS)
+            line.new(latestHigh.bar, latestHigh.price, bar_index, latestHigh.price,
+                 color = c, style = line.style_solid, width = isMSS ? 2 : 1,
+                 extend = extend.none)
+            label.new(bar_index, latestHigh.price, tag,
+                 color = color.new(c, 50),
+                 textcolor = color.white,
+                 style = label.style_label_left,
+                 size = size.small)
+        if isMSS and alertMSS
+            alert("Bullish MSS @ " + str.tostring(latestHigh.price), alert.freq_once_per_bar_close)
+        if not isMSS and alertBOS
+            alert("Bullish BOS @ " + str.tostring(latestHigh.price), alert.freq_once_per_bar_close)
+
+    // Bearish break: close < latestLow.price
+    if not na(latestLow) and f_priceBreaksDown(latestLow.price)
+        latestLow.broken := true
+        bool isMSS = trendDir >= 0
+        trendDir := -1
+        color c = isMSS ? colMSS : colBOS
+        string tag = isMSS ? "MSS" : "BOS"
+        if (isMSS and showMSS) or (not isMSS and showBOS)
+            line.new(latestLow.bar, latestLow.price, bar_index, latestLow.price,
+                 color = c, style = line.style_solid, width = isMSS ? 2 : 1,
+                 extend = extend.none)
+            label.new(bar_index, latestLow.price, tag,
+                 color = color.new(c, 50),
+                 textcolor = color.white,
+                 style = label.style_label_left,
+                 size = size.small)
+        if isMSS and alertMSS
+            alert("Bearish MSS @ " + str.tostring(latestLow.price), alert.freq_once_per_bar_close)
+        if not isMSS and alertBOS
+            alert("Bearish BOS @ " + str.tostring(latestLow.price), alert.freq_once_per_bar_close)
+
+// =============================================================================
+// CISD DETECTION
+// -----------------------------------------------------------------------------
+// Bullish CISD: close > the open of the last opposing (bearish) candle within
+//   the last cisdSourceCount opposing candles. Signals delivery flip.
+// Bearish CISD: close < the open of the last opposing (bullish) candle.
+// =============================================================================
+
+if showCISD and barstate.isconfirmed
+    // --- Bullish CISD ---
+    int foundB = 0
+    float lastBearOpen = na
+    for i = 1 to 30
+        if foundB >= cisdSourceCount
+            break
+        if close[i] < open[i]
+            lastBearOpen := open[i]
+            foundB := foundB + 1
+    if not na(lastBearOpen) and close > lastBearOpen and close[1] <= lastBearOpen
+        label.new(bar_index, low - ta.atr(14) * 0.3, "CISD↑",
+             color = color.new(colCISD, 30),
+             textcolor = color.black,
+             style = label.style_label_up,
+             size = size.small)
+        if alertCISD
+            alert("Bullish CISD @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+    // --- Bearish CISD ---
+    int foundS = 0
+    float lastBullOpen = na
+    for i = 1 to 30
+        if foundS >= cisdSourceCount
+            break
+        if close[i] > open[i]
+            lastBullOpen := open[i]
+            foundS := foundS + 1
+    if not na(lastBullOpen) and close < lastBullOpen and close[1] >= lastBullOpen
+        label.new(bar_index, high + ta.atr(14) * 0.3, "CISD↓",
+             color = color.new(colCISD, 30),
+             textcolor = color.black,
+             style = label.style_label_down,
+             size = size.small)
+        if alertCISD
+            alert("Bearish CISD @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+// =============================================================================
+// ALERT CONDITIONS (dropdown UI)
+// =============================================================================
+
+alertcondition(barstate.isconfirmed and f_isSwingHigh(swingLB),
+               "Swing High formed", "Swing High @ {{ticker}} {{close}}")
+alertcondition(barstate.isconfirmed and f_isSwingLow(swingLB),
+               "Swing Low formed",  "Swing Low @ {{ticker}} {{close}}")
