@@ -1,0 +1,104 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | CRT/PO3 Strategy (backtestable)
+// -----------------------------------------------------------------------------
+// File:        strategies/06_crt_strategy.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concept:     docs/concepts/concept-crt.md
+//              docs/concepts/concept-monsterlab.md (PO3)
+//
+// Setup:
+//   Bullish CRT (3-candle reversal):
+//     - C1: any
+//     - C2: low taken below C1 low (sweep)
+//     - C3: close > C2 high (reclaim)
+//   Entry: open of next bar
+//   SL:    C2.low - slBuf × ATR14
+//   TP:    C2.high + tpMult × (C2.high - C2.low)
+//
+//   Bearish CRT: mirror.
+// =============================================================================
+
+strategy(
+     "ICT/SMC Suite | CRT Strategy",
+     shorttitle = "ICT-CRT-STRAT",
+     overlay = true,
+     pyramiding = 0,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 1,
+     initial_capital = 10000,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.04
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_FILT = "Filters"
+G_RISK = "Risk / Targets"
+G_TIME = "Date Range"
+
+useTimeFilter = input.bool(true, "Restrict to NY-tz session", group = G_FILT)
+sessStr       = input.session("0700-1600", "Allowed entry session (NY tz)",
+                              group = G_FILT)
+useBiasFilter = input.bool(true, "Require HTF bias agreement", group = G_FILT)
+htfRes        = input.timeframe("240", "HTF resolution", options = ["60", "240", "D"], group = G_FILT)
+emaLen        = input.int(20, "HTF EMA length", group = G_FILT)
+
+slBuf  = input.float(0.1, "SL buffer (× ATR14 below C2 extreme)",
+                     minval = 0.0, maxval = 5.0, step = 0.05, group = G_RISK)
+tpMult = input.float(1.0, "TP = C2.range × multiplier",
+                     minval = 0.3, maxval = 5.0, step = 0.1, group = G_RISK)
+
+startDate = input.time(timestamp("01 Jan 2020 00:00"), "Backtest start", group = G_TIME)
+endDate   = input.time(timestamp("31 Dec 2099 00:00"), "Backtest end",   group = G_TIME)
+inDate    = time >= startDate and time <= endDate
+
+// =============================================================================
+// FILTERS
+// =============================================================================
+
+inSess = useTimeFilter ?
+     not na(time(timeframe.period, sessStr + ":23456", "America/New_York")) : true
+htfEMA = request.security(syminfo.tickerid, htfRes,
+     ta.ema(close, emaLen),
+     lookahead = barmerge.lookahead_off)
+biasUp   = useBiasFilter ? close > htfEMA : true
+biasDown = useBiasFilter ? close < htfEMA : true
+
+// =============================================================================
+// CRT 3-CANDLE PATTERN
+// -----------------------------------------------------------------------------
+// We anchor: C2 = bar[1] (just closed prior bar), C1 = bar[2], C3 = current.
+// Bullish CRT: low[1] < low[2] AND close > high[2] AND close > open
+// Bearish CRT: high[1] > high[2] AND close < low[2] AND close < open
+// =============================================================================
+
+bullCRT = low[1] < low[2] and close > high[2] and close > open
+bearCRT = high[1] > high[2] and close < low[2] and close < open
+
+atrV = ta.atr(14)
+c2H  = high[1]
+c2L  = low[1]
+c2Range = c2H - c2L
+
+longCond  = barstate.isconfirmed and bullCRT and biasUp   and inSess and inDate
+shortCond = barstate.isconfirmed and bearCRT and biasDown and inSess and inDate
+
+// =============================================================================
+// ENTRIES
+// =============================================================================
+
+if longCond and strategy.position_size <= 0
+    float slPx = c2L - slBuf * atrV
+    float tpPx = c2H + tpMult * c2Range
+    strategy.entry("L-CRT", strategy.long)
+    strategy.exit("X-L", from_entry = "L-CRT", stop = slPx, limit = tpPx)
+
+if shortCond and strategy.position_size >= 0
+    float slPx = c2H + slBuf * atrV
+    float tpPx = c2L - tpMult * c2Range
+    strategy.entry("S-CRT", strategy.short)
+    strategy.exit("X-S", from_entry = "S-CRT", stop = slPx, limit = tpPx)

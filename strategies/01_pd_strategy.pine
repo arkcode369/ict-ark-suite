@@ -1,0 +1,104 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | PD Array Strategy (backtestable)
+// -----------------------------------------------------------------------------
+// File:        strategies/01_pd_strategy.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concept:     docs/concepts/concept-foundation-model.md (Top-down)
+//              docs/concepts/concept-logic.md (PD Array entries)
+//
+// Setup:
+//   - HTF bias filter: D1 close vs D1 EMA20.
+//   - Bullish entry:  HTF up AND new bull FVG forms (gap up between low[0] and
+//                     high[2]). Entry at next bar open.
+//                     SL = FVG bottom (high[2]). TP = entry + tpATR × ATR14.
+//   - Bearish entry:  HTF down AND new bear FVG forms (gap down between high[0]
+//                     and low[2]). Mirror logic.
+//
+// Use this as a starting template. Wire up your own filters / entries.
+// =============================================================================
+
+strategy(
+     "ICT/SMC Suite | PD Strategy",
+     shorttitle = "ICT-PD-STRAT",
+     overlay = true,
+     pyramiding = 0,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 1,
+     initial_capital = 10000,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.04,
+     calc_on_every_tick = false,
+     process_orders_on_close = false
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_BIAS  = "HTF Bias Filter"
+G_RISK  = "Risk / Targets"
+G_TIME  = "Date Range"
+
+useBiasFilter = input.bool(true, "Require D1 EMA20 bias agreement", group = G_BIAS)
+htfRes        = input.timeframe("D", "HTF resolution", options = ["240", "D", "W"], group = G_BIAS)
+emaLen        = input.int(20, "HTF EMA length", minval = 5, maxval = 200, group = G_BIAS)
+
+tpATR  = input.float(2.0, "TP distance (× ATR14)",
+                     minval = 0.5, maxval = 10.0, step = 0.1, group = G_RISK)
+slBuf  = input.float(0.1, "SL buffer (× ATR14, beyond FVG edge)",
+                     minval = 0.0, maxval = 5.0, step = 0.05, group = G_RISK)
+useTrail = input.bool(false, "Trail SL via ATR14",          group = G_RISK)
+trailATR = input.float(1.5, "Trail distance (× ATR14)",
+                       minval = 0.3, maxval = 5.0, step = 0.1, group = G_RISK)
+
+startDate = input.time(timestamp("01 Jan 2020 00:00"), "Backtest start", group = G_TIME)
+endDate   = input.time(timestamp("31 Dec 2099 00:00"), "Backtest end",   group = G_TIME)
+inDate    = time >= startDate and time <= endDate
+
+// =============================================================================
+// SIGNALS
+// =============================================================================
+
+htfEMA = request.security(syminfo.tickerid, htfRes,
+     ta.ema(close, emaLen),
+     lookahead = barmerge.lookahead_off)
+biasUp   = useBiasFilter ? close > htfEMA : true
+biasDown = useBiasFilter ? close < htfEMA : true
+
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+
+atrV = ta.atr(14)
+
+longCond  = barstate.isconfirmed and bullFVG and biasUp   and inDate
+shortCond = barstate.isconfirmed and bearFVG and biasDown and inDate
+
+// =============================================================================
+// ENTRIES
+// =============================================================================
+
+if longCond and strategy.position_size <= 0
+    float slPx = high[2] - slBuf * atrV
+    float tpPx = close + tpATR * atrV
+    strategy.entry("L", strategy.long)
+    strategy.exit("X-L", from_entry = "L", stop = slPx, limit = tpPx)
+
+if shortCond and strategy.position_size >= 0
+    float slPx = low[2] + slBuf * atrV
+    float tpPx = close - tpATR * atrV
+    strategy.entry("S", strategy.short)
+    strategy.exit("X-S", from_entry = "S", stop = slPx, limit = tpPx)
+
+// =============================================================================
+// OPTIONAL TRAILING STOP
+// =============================================================================
+
+if useTrail and strategy.position_size > 0
+    float trailPx = close - trailATR * atrV
+    strategy.exit("Trail-L", from_entry = "L", stop = trailPx)
+
+if useTrail and strategy.position_size < 0
+    float trailPx = close + trailATR * atrV
+    strategy.exit("Trail-S", from_entry = "S", stop = trailPx)
