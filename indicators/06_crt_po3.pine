@@ -1,0 +1,262 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | CRT & Power of 3 (PO3)
+// -----------------------------------------------------------------------------
+// File:        indicators/06_crt_po3.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concepts:    docs/concepts/concept-crt.md
+//                - 3-candle Range / Manipulation / Distribution framework
+//                - OHLC / OLHC / LOHC / HOLC / OHCL / LHOC candle templates
+//                - 1-5-9 AM Cycle, Key Times
+//                - Wednesday Model (HOD/LOD often forms Wed)
+//                - Model #1: MSS + sweep + entry
+//              docs/concepts/concept-monsterlab.md
+//                - PO3 (Accumulation, Manipulation, Distribution)
+//              docs/concepts/concept-quarterly-theory.md
+//                - PO3 hierarchy across timeframes
+//              docs/concepts/concept-foundation-model.md
+//                - Bullish/Bearish PO3 templates
+//
+// Detected:
+//   - Bullish CRT: C1 range, C2 wicks below C1.low, C2 closes ≥ C1 mid,
+//     C3 closes > C1.high (bullish distribution)
+//   - Bearish CRT: mirror
+//   - Bullish PO3: C1 range, C2 close ≤ C1.low (manipulation),
+//     C3 close > C1.high (distribution out of accumulation/manipulation)
+//   - Bearish PO3: mirror
+//   - Candle template label (OHLC / OLHC / etc.) on each bar (opt-in)
+//   - Wednesday HOD/LOD marker
+//
+// Repaint policy: NONE. Patterns settle on close of C3.
+// =============================================================================
+
+indicator(
+     "ICT/SMC Suite | CRT & PO3",
+     shorttitle = "ICT-CRT",
+     overlay = true,
+     max_boxes_count = 200,
+     max_lines_count = 500,
+     max_labels_count = 500
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_CRT    = "CRT (3-candle)"
+G_PO3    = "Power of 3"
+G_TPL    = "Candle Templates (OHLC/OLHC/...)"
+G_WED    = "Wednesday Model"
+G_DISP   = "Display"
+G_ALERT  = "Alerts"
+
+showCRTBull = input.bool(true, "Bullish CRT", group = G_CRT)
+showCRTBear = input.bool(true, "Bearish CRT", group = G_CRT)
+maxCRT      = input.int(20, "Max CRT boxes kept", minval = 5, maxval = 100, group = G_CRT)
+colCRTBull  = input.color(color.new(color.green, 70), "CRT bull box", group = G_CRT, inline = "crt")
+colCRTBear  = input.color(color.new(color.red,   70), "CRT bear box", group = G_CRT, inline = "crt")
+
+showPO3Bull = input.bool(true, "Bullish PO3", group = G_PO3)
+showPO3Bear = input.bool(true, "Bearish PO3", group = G_PO3)
+maxPO3      = input.int(20, "Max PO3 boxes kept", minval = 5, maxval = 100, group = G_PO3)
+colPO3Bull  = input.color(color.new(color.lime,    50), "PO3 bull box", group = G_PO3, inline = "po3")
+colPO3Bear  = input.color(color.new(color.maroon,  50), "PO3 bear box", group = G_PO3, inline = "po3")
+
+showTpl   = input.bool(false, "Show candle template (OHLC/OLHC/...)", group = G_TPL)
+colTpl    = input.color(color.new(color.silver, 0), "Template label", group = G_TPL)
+
+showWed   = input.bool(true, "Mark Wednesday HOD/LOD", group = G_WED)
+colWed    = input.color(color.new(color.fuchsia, 0), "Wed marker", group = G_WED)
+
+maxBars   = input.int(2000, "Limit drawings to last N bars (0 = no limit)",
+                      minval = 0, maxval = 20000, group = G_DISP)
+
+alertCRT  = input.bool(true, "Alert on CRT formation", group = G_ALERT)
+alertPO3  = input.bool(true, "Alert on PO3 formation", group = G_ALERT)
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+f_drawingAllowed() => maxBars == 0 or bar_index >= last_bar_index - maxBars
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+type Pat
+    int   leftBar
+    float top
+    float bot
+    bool  bullish
+    string kind     // "CRT" | "PO3"
+    box   bx
+    label lb
+
+var array<Pat> patterns = array.new<Pat>()
+
+f_pushPat(int leftBar, float t, float b, bool bullish, string kind, color cc, string txt) =>
+    if f_drawingAllowed()
+        box bx = box.new(leftBar, t, bar_index, b,
+             border_color = color.new(cc, 30),
+             bgcolor = cc,
+             extend = extend.none)
+        label lb = label.new(bar_index, t, txt,
+             color = color.new(cc, 50),
+             textcolor = color.white,
+             style = label.style_label_left,
+             size = size.small)
+        Pat p = Pat.new(leftBar, t, b, bullish, kind, bx, lb)
+        array.push(patterns, p)
+        while array.size(patterns) > (maxCRT + maxPO3)
+            Pat p0 = array.shift(patterns)
+            if not na(p0.bx)
+                box.delete(p0.bx)
+            if not na(p0.lb)
+                label.delete(p0.lb)
+
+// =============================================================================
+// CRT DETECTION
+// -----------------------------------------------------------------------------
+// Reference: 3-candle Range/Manipulation/Distribution.
+//   Bullish CRT (looking back from current confirmed bar c0=close):
+//     c2 = bar 2 ago = Range candle: defines [c2.high, c2.low]
+//     c1 = bar 1 ago = Manipulation: low[1] < low[2] (sweeps low side)
+//     c0 = current   = Distribution: close > high[2] AND close > open[1]
+//   Bearish CRT: mirror
+// =============================================================================
+
+if barstate.isconfirmed
+    bool bullCRT = high[1] >= high[2] ? false : (low[1] < low[2] and close > high[2])
+    // Original test: c1 manipulation (sweeps low), c0 close > c2.high
+    bullCRT := low[1] < low[2] and close > high[2] and close > open
+    bool bearCRT = high[1] > high[2] and close < low[2] and close < open
+
+    if showCRTBull and bullCRT
+        f_pushPat(bar_index - 2, high[2], low[1], true, "CRT", colCRTBull, "CRT↑")
+        if alertCRT
+            alert("Bullish CRT @ " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+    if showCRTBear and bearCRT
+        f_pushPat(bar_index - 2, high[1], low[2], false, "CRT", colCRTBear, "CRT↓")
+        if alertCRT
+            alert("Bearish CRT @ " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+    // -------------------------------------------------------------------------
+    // PO3 DETECTION
+    // -------------------------------------------------------------------------
+    // Bullish PO3:
+    //   c2 = Accumulation (range)
+    //   c1 = Manipulation: close[1] ≤ low[2] (closes outside range to downside)
+    //   c0 = Distribution: close > high[2]
+    bool bullPO3 = close[1] <= low[2] and close > high[2]
+    bool bearPO3 = close[1] >= high[2] and close < low[2]
+
+    if showPO3Bull and bullPO3
+        f_pushPat(bar_index - 2, high[2], low[1], true, "PO3", colPO3Bull, "PO3↑")
+        if alertPO3
+            alert("Bullish PO3 @ " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+    if showPO3Bear and bearPO3
+        f_pushPat(bar_index - 2, high[1], low[2], false, "PO3", colPO3Bear, "PO3↓")
+        if alertPO3
+            alert("Bearish PO3 @ " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+// =============================================================================
+// CANDLE TEMPLATE CLASSIFICATION
+// -----------------------------------------------------------------------------
+// 6 canonical templates per concept-crt.md:
+//   OHLC: open, high, low, close (in price-time order)
+//   OLHC: open, low, high, close
+//   LOHC: low, open, high, close
+//   HOLC: high, open, low, close
+//   OHCL: open, high, close, low
+//   LHOC: low, high, open, close — etc.
+// We classify using the relative order of open/close vs the high/low extremes
+// and direction of close vs open.
+// =============================================================================
+
+f_template() =>
+    string tpl = ""
+    bool bullCandle = close > open
+    if bullCandle
+        // Bullish: close > open. Two main paths:
+        //  - went up first (high before low) → "OHLC" if open touches high early
+        //  - went down first (low before high) → "OLHC"
+        // Heuristic: if low closer to open than high → OLHC, else OHLC
+        bool wentDownFirst = math.abs(low - open) < math.abs(high - open)
+        tpl := wentDownFirst ? "OLHC" : "OHLC"
+    else
+        bool wentUpFirst = math.abs(high - open) < math.abs(low - open)
+        tpl := wentUpFirst ? "OHLC↓" : "OLHC↓"
+    tpl
+
+if showTpl and barstate.isconfirmed
+    if f_drawingAllowed()
+        label.new(bar_index, high + ta.atr(14) * 0.3, f_template(),
+             color = color.new(colTpl, 90),
+             textcolor = colTpl,
+             style = label.style_none,
+             size = size.tiny)
+
+// =============================================================================
+// WEDNESDAY MODEL
+// -----------------------------------------------------------------------------
+// Mark current week's Wednesday HOD and LOD as horizontal lines that often
+// remain unviolated. Marker is placed at the Wednesday close.
+// =============================================================================
+
+var float wedHigh = na
+var float wedLow  = na
+var int   wedBar  = na
+
+bool isWed = dayofweek(time, "America/New_York") == dayofweek.wednesday
+bool wedClose = isWed and dayofweek(time[1], "America/New_York") == dayofweek.wednesday and
+                not (dayofweek(time, "America/New_York") == dayofweek.wednesday and
+                     dayofweek(time[1], "America/New_York") == dayofweek.wednesday and
+                     hour(time, "America/New_York") < 23)
+
+if isWed and not (dayofweek(time[1], "America/New_York") == dayofweek.wednesday)
+    // First bar of Wednesday → reset
+    wedHigh := high
+    wedLow  := low
+    wedBar  := bar_index
+else if isWed
+    wedHigh := math.max(nz(wedHigh, high), high)
+    wedLow  := math.min(nz(wedLow, low),   low)
+
+// On first non-Wed bar after Wednesday → emit marker
+bool wedDone = not isWed and dayofweek(time[1], "America/New_York") == dayofweek.wednesday
+if showWed and wedDone and not na(wedHigh) and not na(wedLow) and f_drawingAllowed()
+    line.new(wedBar, wedHigh, bar_index, wedHigh,
+         color = colWed,
+         style = line.style_dotted,
+         extend = extend.right)
+    line.new(wedBar, wedLow, bar_index, wedLow,
+         color = colWed,
+         style = line.style_dotted,
+         extend = extend.right)
+    label.new(bar_index, wedHigh, "Wed HOD",
+         color = color.new(colWed, 80),
+         textcolor = colWed,
+         style = label.style_label_left,
+         size = size.tiny)
+    label.new(bar_index, wedLow, "Wed LOD",
+         color = color.new(colWed, 80),
+         textcolor = colWed,
+         style = label.style_label_left,
+         size = size.tiny)
+
+// =============================================================================
+// ALERT CONDITIONS
+// =============================================================================
+
+alertcondition(barstate.isconfirmed and low[1] < low[2] and close > high[2] and close > open,
+               "Bullish CRT", "Bull CRT @ {{ticker}} {{close}}")
+alertcondition(barstate.isconfirmed and high[1] > high[2] and close < low[2] and close < open,
+               "Bearish CRT", "Bear CRT @ {{ticker}} {{close}}")
+alertcondition(barstate.isconfirmed and close[1] <= low[2] and close > high[2],
+               "Bullish PO3",  "Bull PO3 @ {{ticker}} {{close}}")
+alertcondition(barstate.isconfirmed and close[1] >= high[2] and close < low[2],
+               "Bearish PO3",  "Bear PO3 @ {{ticker}} {{close}}")
