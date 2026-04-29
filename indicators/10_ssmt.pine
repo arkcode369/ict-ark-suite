@@ -1,0 +1,200 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | sSMT — Sequential SMT Divergence
+// -----------------------------------------------------------------------------
+// File:        indicators/10_ssmt.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concepts:    docs/concepts/concept-quarterly-theory.md
+//                - sSMT (Sequential SMT) — divergence between correlated
+//                  assets at swing levels
+//              docs/concepts/concept-logic.md
+//                - SMT context within ICT framework
+//
+// Detected:
+//   - Bearish sSMT: chart asset makes higher high than its prior swing,
+//     while one or more correlated assets make a lower high (failure to
+//     confirm) at the same swing event.
+//   - Bullish sSMT: chart asset makes lower low than its prior swing,
+//     while correlated asset(s) make higher low (failure to confirm).
+//
+// User inputs up to 3 correlated symbols. Default suggestions (forex/indices):
+//   ES1! / NQ1! / YM1!  — index futures triad
+//   EURUSD / GBPUSD / DXY (inverse) — forex DXY-correlated triad
+//
+// Repaint policy: swings repaint within the swing lookback window. Once
+//   confirmed, divergence labels are stable.
+// =============================================================================
+
+indicator(
+     "ICT/SMC Suite | sSMT",
+     shorttitle = "ICT-sSMT",
+     overlay = true,
+     max_lines_count = 500,
+     max_labels_count = 500
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_SYM   = "Correlated Symbols"
+G_DET   = "Detection"
+G_DISP  = "Display"
+G_ALERT = "Alerts"
+
+sym1 = input.symbol("CME_MINI:ES1!",  "Symbol 1", group = G_SYM)
+sym2 = input.symbol("CME_MINI:NQ1!",  "Symbol 2", group = G_SYM)
+sym3 = input.symbol("CME_MINI:YM1!",  "Symbol 3 (optional)", group = G_SYM)
+useSym3 = input.bool(true, "Use Symbol 3", group = G_SYM)
+
+invertSym1 = input.bool(false, "Invert Symbol 1 (e.g. DXY for forex)", group = G_SYM)
+invertSym2 = input.bool(false, "Invert Symbol 2", group = G_SYM)
+invertSym3 = input.bool(false, "Invert Symbol 3", group = G_SYM)
+
+swingLB    = input.int(5, "Swing lookback (3-bar fractal half-width)",
+                       minval = 2, maxval = 30, group = G_DET)
+maxSwings  = input.int(20, "Max swings per side kept", minval = 5, maxval = 100, group = G_DET)
+requireAll = input.bool(false,
+                "Require ALL correlated symbols to diverge (vs ANY)", group = G_DET)
+
+showLines = input.bool(true, "Draw line connecting diverging swings", group = G_DISP)
+showLabel = input.bool(true, "Show 'sSMT' label",                     group = G_DISP)
+colBull   = input.color(color.new(color.lime,    0), "Bullish sSMT",  group = G_DISP, inline = "ssc")
+colBear   = input.color(color.new(color.red,     0), "Bearish sSMT",  group = G_DISP, inline = "ssc")
+
+alertOn = input.bool(true, "Alert on sSMT formation", group = G_ALERT)
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+f_secHL(string sym, bool invert) =>
+    [hRaw, lRaw] = request.security(sym, timeframe.period,
+         [high, low],
+         lookahead = barmerge.lookahead_off)
+    float outH = invert ? -lRaw : hRaw
+    float outL = invert ? -hRaw : lRaw
+    [outH, outL]
+
+[h1, l1] = f_secHL(sym1, invertSym1)
+[h2, l2] = f_secHL(sym2, invertSym2)
+[h3raw, l3raw] = f_secHL(sym3, invertSym3)
+float h3 = useSym3 ? h3raw : na
+float l3 = useSym3 ? l3raw : na
+
+f_isSwingHigh(simple int lb) =>
+    bool ok = true
+    for i = 0 to lb * 2
+        if i != lb and high[i] > high[lb]
+            ok := false
+            break
+    ok
+
+f_isSwingLow(simple int lb) =>
+    bool ok = true
+    for i = 0 to lb * 2
+        if i != lb and low[i] < low[lb]
+            ok := false
+            break
+    ok
+
+// =============================================================================
+// SWING TRACKING (chart asset)
+// =============================================================================
+
+type Sw
+    float chartPrice
+    float s1
+    float s2
+    float s3
+    int   bar
+    bool  isHigh
+
+var array<Sw> chartHighs = array.new<Sw>()
+var array<Sw> chartLows  = array.new<Sw>()
+
+if barstate.isconfirmed
+    if f_isSwingHigh(swingLB)
+        Sw s = Sw.new(high[swingLB], h1[swingLB], h2[swingLB],
+                      useSym3 ? h3[swingLB] : na, bar_index - swingLB, true)
+        array.push(chartHighs, s)
+        while array.size(chartHighs) > maxSwings
+            array.shift(chartHighs)
+
+    if f_isSwingLow(swingLB)
+        Sw s = Sw.new(low[swingLB], l1[swingLB], l2[swingLB],
+                      useSym3 ? l3[swingLB] : na, bar_index - swingLB, false)
+        array.push(chartLows, s)
+        while array.size(chartLows) > maxSwings
+            array.shift(chartLows)
+
+// =============================================================================
+// DIVERGENCE DETECTION
+// -----------------------------------------------------------------------------
+// Bearish sSMT: latest chart-high > prior chart-high AND
+//   - if requireAll: each correlated symbol's matching swing < its prior
+//   - else (any):    at least one correlated symbol's swing < its prior
+// Bullish sSMT: mirror on lows
+// =============================================================================
+
+f_chkDiv(float curS, float prevS, bool wantLower) =>
+    // wantLower=true → curS < prevS (i.e. correlated diverged from chart's HH)
+    if na(curS) or na(prevS)
+        false
+    else if wantLower
+        curS < prevS
+    else
+        curS > prevS
+
+if barstate.isconfirmed and array.size(chartHighs) >= 2
+    Sw last = array.get(chartHighs, array.size(chartHighs) - 1)
+    Sw prev = array.get(chartHighs, array.size(chartHighs) - 2)
+    if last.chartPrice > prev.chartPrice
+        bool d1 = f_chkDiv(last.s1, prev.s1, true)
+        bool d2 = f_chkDiv(last.s2, prev.s2, true)
+        bool d3 = useSym3 ? f_chkDiv(last.s3, prev.s3, true) : (requireAll ? true : false)
+        bool divergence = requireAll ? (d1 and d2 and (useSym3 ? d3 : true))
+                                     : (d1 or d2 or (useSym3 ? d3 : false))
+        if divergence
+            if showLines
+                line.new(prev.bar, prev.chartPrice, last.bar, last.chartPrice,
+                     color = colBear,
+                     style = line.style_dashed,
+                     width = 2)
+            if showLabel
+                label.new(last.bar, last.chartPrice, "sSMT↓",
+                     color = color.new(colBear, 50),
+                     textcolor = color.white,
+                     style = label.style_label_down,
+                     size = size.small)
+            if alertOn
+                alert("Bearish sSMT @ " + syminfo.ticker + " " +
+                      str.tostring(last.chartPrice), alert.freq_once_per_bar_close)
+
+if barstate.isconfirmed and array.size(chartLows) >= 2
+    Sw last = array.get(chartLows, array.size(chartLows) - 1)
+    Sw prev = array.get(chartLows, array.size(chartLows) - 2)
+    if last.chartPrice < prev.chartPrice
+        bool d1 = f_chkDiv(last.s1, prev.s1, false)
+        bool d2 = f_chkDiv(last.s2, prev.s2, false)
+        bool d3 = useSym3 ? f_chkDiv(last.s3, prev.s3, false) : (requireAll ? true : false)
+        bool divergence = requireAll ? (d1 and d2 and (useSym3 ? d3 : true))
+                                     : (d1 or d2 or (useSym3 ? d3 : false))
+        if divergence
+            if showLines
+                line.new(prev.bar, prev.chartPrice, last.bar, last.chartPrice,
+                     color = colBull,
+                     style = line.style_dashed,
+                     width = 2)
+            if showLabel
+                label.new(last.bar, last.chartPrice, "sSMT↑",
+                     color = color.new(colBull, 50),
+                     textcolor = color.white,
+                     style = label.style_label_up,
+                     size = size.small)
+            if alertOn
+                alert("Bullish sSMT @ " + syminfo.ticker + " " +
+                      str.tostring(last.chartPrice), alert.freq_once_per_bar_close)
+
+alertcondition(barstate.isconfirmed, "sSMT bar close", "Bar close")
