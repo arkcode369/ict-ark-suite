@@ -321,8 +321,29 @@ f_walkAndSweep(array<Liq> arr) =>
                         f_deleteLiq(lq)
                         array.remove(arr, i)
 
+// Track sweep state for plot output (Modul 09 dashboard binding)
+var int sweepFlag = 0    // 0 = none, 1 = BSL swept this bar, -1 = SSL swept this bar
+
+f_walkAndSweepWithFlag(array<Liq> arr, bool isBSL) =>
+    if array.size(arr) > 0
+        int n = array.size(arr)
+        for k = 0 to n - 1
+            int i = n - 1 - k
+            if i >= array.size(arr)
+                continue
+            Liq lq = array.get(arr, i)
+            if not lq.swept
+                string dir = f_sweepDir(lq)
+                if dir != ""
+                    sweepFlag := isBSL ? 1 : -1
+
+if barstate.isconfirmed
+    sweepFlag := 0  // reset each confirmed bar
+
 f_walkAndSweep(bsls)
 f_walkAndSweep(ssls)
+f_walkAndSweepWithFlag(bsls, true)
+f_walkAndSweepWithFlag(ssls, false)
 
 // Update right edge of lines/labels each bar to follow price
 if extendRight
@@ -360,6 +381,13 @@ if showRange
                             border_width = 1,
                             bgcolor = colIRL,
                             extend = extend.none)
+
+// =============================================================================
+// HIDDEN OUTPUT PLOTS FOR DASHBOARD BINDING (Modul 09 input.source)
+// =============================================================================
+
+plot(sweepFlag, title = "ICT-LIT: sweepFlag (1=BSL swept, -1=SSL swept)",
+     display = display.data_window, color = color.new(color.white, 100))
 
 // =============================================================================
 // ALERT CONDITIONS (dropdown)

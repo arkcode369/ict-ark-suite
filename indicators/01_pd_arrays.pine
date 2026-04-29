@@ -358,6 +358,19 @@ f_trim(obs,      maxOB)
 f_trim(breakers, maxBrk)
 
 // =============================================================================
+// HIDDEN OUTPUT PLOTS FOR DASHBOARD BINDING (Modul 09 input.source)
+// =============================================================================
+
+plot(bullFvgNew ? 1 : 0, title = "ICT-PD: bullFvgFlag",
+     display = display.data_window, color = color.new(color.white, 100))
+plot(bearFvgNew ? 1 : 0, title = "ICT-PD: bearFvgFlag",
+     display = display.data_window, color = color.new(color.white, 100))
+plot(isImpUp ? 1 : 0,    title = "ICT-PD: bullOBFlag",
+     display = display.data_window, color = color.new(color.white, 100))
+plot(isImpDown ? 1 : 0,  title = "ICT-PD: bearOBFlag",
+     display = display.data_window, color = color.new(color.white, 100))
+
+// =============================================================================
 // ALERT CONDITIONS (also available via alertcondition for dropdown UI)
 // =============================================================================
 alertcondition(bullFvgNew, "Bull FVG formed", "Bull FVG @ {{ticker}} {{close}}")
