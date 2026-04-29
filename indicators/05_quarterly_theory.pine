@@ -9,8 +9,11 @@
 //                - Q1-Q4 AMD / XAMD / AMDX cycles (Yearly, Monthly, Weekly,
 //                  Daily, Session, Micro)
 //                - True Opens hierarchy (Year, Month, Week, Day, Session, Micro)
-//                - DFR (Defining Range) — placeholder, see notes
-//                - sSMT — multi-asset, not implemented in v0.1 (see ROADMAP)
+//                - DFR (Defining Range) — projection from chosen quarter
+//                - Magneto / Doubling Theory — Q1 mid magnet level
+//                - Pi Ranges — HTF Q1 range projected to current chart
+//              docs/concepts/concept-monsterlab.md
+//                - PO3 + STDV synergy with Q-cycle
 //
 // Drawn:
 //   - Daily Q1–Q4 boundaries (6-hour quarters in NY tz):
@@ -44,6 +47,9 @@ indicator(
 G_QD     = "Daily Quarters"
 G_QS     = "Session Quarters (90m)"
 G_TO     = "True Opens"
+G_DFR    = "DFR (Defining Range)"
+G_MAG    = "Magneto / Doubling"
+G_PI     = "Pi Ranges"
 G_DISP   = "Display"
 
 showDQ   = input.bool(true,  "Show Daily Quarter boundaries (6h)", group = G_QD)
@@ -69,6 +75,41 @@ extendOpens   = input.bool(true,  "Extend True Open lines to current bar", group
 maxOpensKept  = input.int(20,
                   "Max each True Open lines kept",
                   minval = 2, maxval = 200, group = G_DISP)
+
+// --- DFR ---
+showDFR  = input.bool(true,
+            "Show DFR projection levels",
+            group = G_DFR)
+dfrSrc   = input.string("prev_q1",
+            "DFR source quarter",
+            options = ["prev_q1", "prev_q2", "prev_q3", "prev_q4"],
+            group = G_DFR)
+dfrLevels = input.string("-2,-1,0,1,2,2.5,4",
+            "DFR levels (comma-separated, in STDV units of half-range)",
+            group = G_DFR)
+colDFR    = input.color(color.new(color.fuchsia, 30),
+            "DFR line color",
+            group = G_DFR)
+maxDFR    = input.int(10, "Max DFR projections kept",
+            minval = 1, maxval = 50, group = G_DFR)
+
+// --- Magneto / Doubling ---
+showMag  = input.bool(true,
+            "Show Q1 mid as Magneto level",
+            group = G_MAG)
+showDbl  = input.bool(true,
+            "Show Doubling target (2× Q1 range projected from Q3)",
+            group = G_MAG)
+colMag   = input.color(color.new(color.yellow, 0), "Magneto color", group = G_MAG)
+colDbl   = input.color(color.new(color.lime,   0), "Doubling target", group = G_MAG)
+
+// --- Pi Ranges ---
+showPi   = input.bool(true, "Show HTF Q1 range projected to chart", group = G_PI)
+piHTF    = input.timeframe("D",
+            "HTF for Pi range source",
+            options = ["60", "240", "D", "W"],
+            group = G_PI)
+colPi    = input.color(color.new(color.aqua, 70), "Pi range box", group = G_PI)
 
 maxBars = input.int(2000, "Limit drawings to last N bars (0 = no limit)",
                     minval = 0, maxval = 20000, group = G_DISP)
@@ -230,6 +271,277 @@ f_updateExtend(twoLines)
 f_updateExtend(tmoLines)
 f_updateExtend(tyoLines)
 f_updateExtend(tsoLines)
+
+// =============================================================================
+// QUARTER TRACKING (state for DFR / Magneto / Doubling)
+// -----------------------------------------------------------------------------
+// Track each daily quarter's H/L. Quarters are 6h slots (per Daniel's QT):
+//   Q1 18:00–00:00, Q2 00:00–06:00, Q3 06:00–12:00, Q4 12:00–18:00.
+// =============================================================================
+
+f_currentQ() =>
+    int H = hour(time, "America/New_York")
+    int q = H >= 18 ? 1 : H < 6 ? 2 : H < 12 ? 3 : 4
+    q
+
+type QRange
+    float h
+    float l
+    int   leftBar
+    int   rightBar
+    int   q
+
+var QRange q1 = na
+var QRange q2 = na
+var QRange q3 = na
+var QRange q4 = na
+
+// Previous-day quarters (latched at quarter end)
+var QRange prevQ1 = na
+var QRange prevQ2 = na
+var QRange prevQ3 = na
+var QRange prevQ4 = na
+
+f_resetQ(QRange q, int leftBar, int qIdx) =>
+    QRange.new(high, low, leftBar, leftBar, qIdx)
+
+f_extendQ(QRange q) =>
+    if not na(q)
+        q.h := math.max(q.h, high)
+        q.l := math.min(q.l, low)
+        q.rightBar := bar_index
+
+if barstate.isconfirmed
+    int curQ = f_currentQ()
+    bool startQ1 = f_isFirstBarOf(18, 0)
+    bool startQ2 = f_isFirstBarOf(0, 0)
+    bool startQ3 = f_isFirstBarOf(6, 0)
+    bool startQ4 = f_isFirstBarOf(12, 0)
+
+    // On quarter start: latch previous quarter then reset current
+    if startQ2
+        prevQ1 := q1
+        q1     := na
+        q2     := f_resetQ(q2, bar_index, 2)
+    else if startQ3
+        prevQ2 := q2
+        q2     := na
+        q3     := f_resetQ(q3, bar_index, 3)
+    else if startQ4
+        prevQ3 := q3
+        q3     := na
+        q4     := f_resetQ(q4, bar_index, 4)
+    else if startQ1
+        prevQ4 := q4
+        q4     := na
+        q1     := f_resetQ(q1, bar_index, 1)
+    else
+        if curQ == 1
+            if na(q1)
+                q1 := f_resetQ(q1, bar_index, 1)
+            f_extendQ(q1)
+        else if curQ == 2
+            if na(q2)
+                q2 := f_resetQ(q2, bar_index, 2)
+            f_extendQ(q2)
+        else if curQ == 3
+            if na(q3)
+                q3 := f_resetQ(q3, bar_index, 3)
+            f_extendQ(q3)
+        else if curQ == 4
+            if na(q4)
+                q4 := f_resetQ(q4, bar_index, 4)
+            f_extendQ(q4)
+
+// =============================================================================
+// DFR (Defining Range)
+// -----------------------------------------------------------------------------
+// User picks a source quarter (prev_q1 / q2 / q3 / q4); DFR computes range as
+// half-deviation = (H - L) / 2; mid = (H + L) / 2; projection at lvl × half-dev.
+// One set of lines per DFR cycle (recreate when source quarter updates).
+// =============================================================================
+
+type DfrSet
+    int    bar
+    float  mid
+    float  hd
+    array<line>  lns
+    array<label> lbs
+
+var array<DfrSet> dfrSets = array.new<DfrSet>()
+var int lastDfrBar = na
+
+f_pickDFR() =>
+    QRange res = na
+    if dfrSrc == "prev_q1"
+        res := prevQ1
+    else if dfrSrc == "prev_q2"
+        res := prevQ2
+    else if dfrSrc == "prev_q3"
+        res := prevQ3
+    else
+        res := prevQ4
+    res
+
+f_parseLevels(string s) =>
+    array<float> arr = array.new<float>()
+    string buf = ""
+    for i = 0 to str.length(s) - 1
+        string ch = str.substring(s, i, i + 1)
+        if ch == ","
+            if str.length(buf) > 0
+                float v = str.tonumber(buf)
+                if not na(v)
+                    array.push(arr, v)
+                buf := ""
+        else
+            buf := buf + ch
+    if str.length(buf) > 0
+        float v2 = str.tonumber(buf)
+        if not na(v2)
+            array.push(arr, v2)
+    arr
+
+if showDFR and barstate.isconfirmed
+    QRange src = f_pickDFR()
+    if not na(src) and not na(src.h) and not na(src.l) and src.h > src.l and src.rightBar != lastDfrBar
+        lastDfrBar := src.rightBar
+        array<float> lvls = f_parseLevels(dfrLevels)
+        float mid = math.avg(src.h, src.l)
+        float hd  = (src.h - src.l) / 2.0
+        DfrSet ds = DfrSet.new(bar_index, mid, hd, array.new<line>(), array.new<label>())
+        if array.size(lvls) > 0 and f_drawingAllowed()
+            for k = 0 to array.size(lvls) - 1
+                float lv = array.get(lvls, k)
+                float p = mid + lv * hd
+                line ln = line.new(src.rightBar, p, bar_index, p,
+                     color = colDFR,
+                     style = lv == 0 ? line.style_solid : line.style_dashed,
+                     extend = extend.right)
+                label lb = label.new(bar_index, p,
+                     "DFR " + str.tostring(lv) + " (" + dfrSrc + ")",
+                     color = color.new(colDFR, 80),
+                     textcolor = colDFR,
+                     style = label.style_label_left,
+                     size = size.tiny)
+                array.push(ds.lns, ln)
+                array.push(ds.lbs, lb)
+        array.push(dfrSets, ds)
+        while array.size(dfrSets) > maxDFR
+            DfrSet ds0 = array.shift(dfrSets)
+            if array.size(ds0.lns) > 0
+                for j = 0 to array.size(ds0.lns) - 1
+                    line.delete(array.get(ds0.lns, j))
+            if array.size(ds0.lbs) > 0
+                for j = 0 to array.size(ds0.lbs) - 1
+                    label.delete(array.get(ds0.lbs, j))
+
+// =============================================================================
+// MAGNETO / DOUBLING
+// -----------------------------------------------------------------------------
+// Magneto: Q1 mid acts as magnet; price tends to revisit it during Q3 / Q4.
+// Doubling: target = Q3.high + (Q1 range) projected (bullish day) /
+//           Q3.low - (Q1 range) (bearish day).
+// =============================================================================
+
+var line magLine = na
+var line dblLine = na
+var label magLb  = na
+var label dblLb  = na
+
+if showMag and not na(q1) and not na(q1.h) and not na(q1.l)
+    float mid = math.avg(q1.h, q1.l)
+    if na(magLine)
+        magLine := line.new(q1.leftBar, mid, bar_index, mid,
+             color = colMag,
+             style = line.style_dashed,
+             width = 2,
+             extend = extend.right)
+        magLb := label.new(bar_index, mid, "Magneto (Q1 mid)",
+             color = color.new(colMag, 70),
+             textcolor = colMag,
+             style = label.style_label_left,
+             size = size.tiny)
+    else
+        line.set_xy1(magLine, q1.leftBar, mid)
+        line.set_xy2(magLine, bar_index, mid)
+        label.set_xy(magLb, bar_index, mid)
+
+if showDbl and not na(q1) and not na(q3) and not na(q1.h) and not na(q1.l) and
+   not na(q3.h) and not na(q3.l)
+    float q1range = q1.h - q1.l
+    bool bullish = q3.h > q1.h
+    float target = bullish ? q3.h + q1range : q3.l - q1range
+    if na(dblLine)
+        dblLine := line.new(q3.leftBar, target, bar_index, target,
+             color = colDbl,
+             style = line.style_dotted,
+             width = 2,
+             extend = extend.right)
+        dblLb := label.new(bar_index, target,
+             "Doubling target (" + (bullish ? "bull" : "bear") + ")",
+             color = color.new(colDbl, 70),
+             textcolor = colDbl,
+             style = label.style_label_left,
+             size = size.tiny)
+    else
+        line.set_xy1(dblLine, q3.leftBar, target)
+        line.set_xy2(dblLine, bar_index, target)
+        line.set_color(dblLine, colDbl)
+        label.set_xy(dblLb, bar_index, target)
+        label.set_text(dblLb, "Doubling target (" + (bullish ? "bull" : "bear") + ")")
+
+// =============================================================================
+// Pi RANGES
+// -----------------------------------------------------------------------------
+// Take HTF Q1 range (= first 6h of HTF day) and project to current chart.
+// Implementation: request.security with 6h offset window from HTF open.
+// Simpler: fetch HTF first-quarter H/L via session-aware request.
+// We approximate: HTF "Q1" = bars where time-of-day is in [18, 24] of NY tz on
+// the HTF anchor — i.e. session "1800-2400:23456" in HTF.
+// =============================================================================
+
+// Approach: track on chart TF when bar's HTF time-of-day is inside the HTF
+// Q1 window. We use the chart-TF clock (time function) anchored at HTF
+// resolution.
+
+f_isHTFQ1Now() =>
+    not na(time(piHTF, "1800-2400:23456", "America/New_York"))
+
+var float piHi = na
+var float piLo = na
+var int   piLeftBar = na
+var box   piBx      = na
+var label piLbl     = na
+
+bool inHTFQ1 = f_isHTFQ1Now()
+bool inHTFQ1Prev = inHTFQ1[1]
+bool startedHTFQ1 = inHTFQ1 and not inHTFQ1Prev
+bool endedHTFQ1   = not inHTFQ1 and inHTFQ1Prev
+
+if showPi
+    if startedHTFQ1
+        piHi := high
+        piLo := low
+        piLeftBar := bar_index
+    else if inHTFQ1 and not na(piLeftBar)
+        piHi := math.max(piHi, high)
+        piLo := math.min(piLo, low)
+    if endedHTFQ1 and not na(piLeftBar) and not na(piHi) and not na(piLo) and f_drawingAllowed()
+        if not na(piBx)
+            box.delete(piBx)
+        if not na(piLbl)
+            label.delete(piLbl)
+        piBx := box.new(piLeftBar, piHi, bar_index, piLo,
+             border_color = color.new(colPi, 50),
+             bgcolor = colPi,
+             extend = extend.right)
+        piLbl := label.new(bar_index, piHi,
+             "Pi Range (" + piHTF + " Q1)",
+             color = color.new(colPi, 70),
+             textcolor = color.white,
+             style = label.style_label_left,
+             size = size.tiny)
 
 // =============================================================================
 // ALERT CONDITIONS
