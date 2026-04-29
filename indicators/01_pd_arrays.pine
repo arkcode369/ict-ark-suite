@@ -1,0 +1,366 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | PD Arrays (FVG / OB / Breaker / Mitigation)
+// -----------------------------------------------------------------------------
+// File:        indicators/01_pd_arrays.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concepts:    docs/concepts/concept-logic.md (FVG, OB, Breaker, Mitigation)
+//              docs/concepts/concept-turtle-soup.md (FVG internal structure)
+//
+// Detected zones:
+//   - Bullish & Bearish Fair Value Gap (FVG)
+//   - Bullish & Bearish Order Block (OB) — last opposing candle before
+//     a displacement that closes through structure
+//   - Breaker Block — an OB that gets violated and re-tagged from the
+//     opposite side (function-flipped support/resistance)
+//   - Mitigation tracking — every zone is tagged "mitigated" when price
+//     wicks back into it, and "invalidated" when price closes through it
+//
+// Repaint policy:
+//   - FVG:        none after the bar closes (gap geometry fixed)
+//   - OB:         settled on the bar after displacement; no repaint after
+//   - Breaker:    settled on the bar a violated OB is breached
+//   - Mitigation: never repaints (real-time on wick re-entry)
+//
+// Limits:
+//   max_boxes_count / max_lines_count / max_labels_count = 500 each.
+//   Configurable FIFO pruning per zone type.
+// =============================================================================
+
+indicator(
+     "ICT/SMC Suite | PD Arrays",
+     shorttitle = "ICT-PD",
+     overlay = true,
+     max_boxes_count = 500,
+     max_lines_count = 500,
+     max_labels_count = 500
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_DISP   = "Display"
+G_FVG    = "Detection — FVG"
+G_OB     = "Detection — Order Block"
+G_BRK    = "Detection — Breaker"
+G_MIT    = "Mitigation"
+G_FILT   = "Filter"
+G_ALERT  = "Alerts"
+
+// --- Display ---
+showBullFvg = input.bool(true,  "Show Bullish FVG",   group = G_DISP)
+showBearFvg = input.bool(true,  "Show Bearish FVG",   group = G_DISP)
+showBullOB  = input.bool(true,  "Show Bullish OB",    group = G_DISP)
+showBearOB  = input.bool(true,  "Show Bearish OB",    group = G_DISP)
+showBreaker = input.bool(true,  "Show Breaker Blocks", group = G_DISP)
+showCE      = input.bool(false, "Show CE (50% midline) of zones", group = G_DISP)
+extendRight = input.bool(true,  "Extend zones to current bar",     group = G_DISP)
+
+colBullFvg  = input.color(color.new(color.teal,  80), "Bull FVG color",  group = G_DISP, inline = "fvg")
+colBearFvg  = input.color(color.new(color.red,   80), "Bear FVG color",  group = G_DISP, inline = "fvg")
+colBullOB   = input.color(color.new(color.green, 75), "Bull OB color",   group = G_DISP, inline = "ob")
+colBearOB   = input.color(color.new(color.maroon,75), "Bear OB color",   group = G_DISP, inline = "ob")
+colBreaker  = input.color(color.new(color.orange,75), "Breaker color",   group = G_DISP)
+colMit      = input.color(color.new(color.gray,  85), "Mitigated tint",  group = G_DISP)
+
+maxFvg      = input.int(30, "Max FVG zones kept",    minval = 5, maxval = 200, group = G_DISP)
+maxOB       = input.int(20, "Max OB zones kept",     minval = 5, maxval = 200, group = G_DISP)
+maxBrk      = input.int(20, "Max Breaker zones kept",minval = 5, maxval = 200, group = G_DISP)
+
+// --- Detection: FVG ---
+fvgAtrFilter = input.float(0.0, "FVG min size (× ATR14, 0 = no filter)", minval = 0.0, step = 0.1, group = G_FVG)
+
+// --- Detection: OB ---
+obDisplacement = input.float(1.0, "OB minimum displacement (× ATR14)",  minval = 0.0, step = 0.1, group = G_OB)
+obLookback     = input.int(  5,   "OB lookback (bars to scan opposing)",minval = 1,   maxval = 20, group = G_OB)
+obMitigationRule = input.string("wick", "OB mitigation rule", options = ["wick", "body", "CE"], group = G_OB)
+
+// --- Detection: Breaker ---
+brkRequireMSS = input.bool(true, "Breaker requires structural break (MSS)", group = G_BRK)
+
+// --- Mitigation ---
+mitFvgRule = input.string("wick", "FVG mitigation rule", options = ["wick", "body", "CE"], group = G_MIT)
+fadeMitigated = input.bool(true, "Fade mitigated zones to gray", group = G_MIT)
+deleteInvalid = input.bool(true, "Delete invalidated zones",     group = G_MIT)
+
+// --- Filter ---
+filterByBias = input.bool(false, "Only show zones aligned with HTF bias", group = G_FILT)
+htfBiasTF    = input.timeframe("D", "HTF for bias",                       group = G_FILT)
+
+// --- Alerts ---
+alertNewFvg   = input.bool(true, "Alert on new FVG",            group = G_ALERT)
+alertNewOB    = input.bool(true, "Alert on new OB",             group = G_ALERT)
+alertNewBrk   = input.bool(true, "Alert on Breaker formation",  group = G_ALERT)
+alertMitig    = input.bool(true, "Alert on zone mitigation",    group = G_ALERT)
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+type Zone
+    float top
+    float bot
+    int   left
+    bool  bullish
+    string kind        // "FVG" | "OB" | "BRK"
+    bool  mitigated   = false
+    bool  invalidated = false
+    box   bx          = na
+    line  ceLn        = na
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+f_ce(float t, float b) => math.avg(t, b)
+
+// HTF bias via simple HTF EMA20 vs price
+htfClose = request.security(syminfo.tickerid, htfBiasTF, close, lookahead = barmerge.lookahead_off)
+htfEma   = ta.ema(htfClose, 20)
+htfBias  = htfClose > htfEma ? 1 : htfClose < htfEma ? -1 : 0
+
+// Apply bias filter: returns true if zone aligned with HTF bias OR filter off
+f_passBias(bool bullish) =>
+    not filterByBias or (bullish and htfBias >= 0) or (not bullish and htfBias <= 0)
+
+// Color picker for current zone state
+f_zoneColor(string kind, bool bullish, bool mitigated) =>
+    base = switch
+        kind == "FVG" and bullish     => colBullFvg
+        kind == "FVG" and not bullish => colBearFvg
+        kind == "OB"  and bullish     => colBullOB
+        kind == "OB"  and not bullish => colBearOB
+        kind == "BRK"                 => colBreaker
+        =>                               color.new(color.gray, 85)
+    mitigated and fadeMitigated ? colMit : base
+
+// Mitigation check
+f_mitigated(Zone z, string rule) =>
+    bool m = false
+    if z.bullish
+        m := switch rule
+            "wick" => low <= z.top
+            "body" => math.min(open, close) <= z.top
+            "CE"   => low <= f_ce(z.top, z.bot)
+            =>        low <= z.top
+    else
+        m := switch rule
+            "wick" => high >= z.bot
+            "body" => math.max(open, close) >= z.bot
+            "CE"   => high >= f_ce(z.top, z.bot)
+            =>        high >= z.bot
+    m
+
+f_invalidated(Zone z) =>
+    z.bullish ? close < z.bot : close > z.top
+
+// Draw zone box and (optionally) CE midline. Returns the same Zone with
+// bx / ceLn fields populated.
+f_drawZone(Zone z) =>
+    int rightBar = bar_index
+    color c = f_zoneColor(z.kind, z.bullish, z.mitigated)
+    bx = box.new(z.left, z.top, rightBar, z.bot,
+         border_color = na,
+         bgcolor = c,
+         extend = extendRight ? extend.right : extend.none)
+    line ln = na
+    if showCE
+        float ceVal = f_ce(z.top, z.bot)
+        ln := line.new(z.left, ceVal, rightBar, ceVal,
+             color = color.new(c, 50),
+             style = line.style_dotted,
+             extend = extendRight ? extend.right : extend.none)
+    z.bx := bx
+    z.ceLn := ln
+    z
+
+// Update zone visuals after state change
+f_refreshZone(Zone z) =>
+    if not na(z.bx)
+        box.set_bgcolor(z.bx, f_zoneColor(z.kind, z.bullish, z.mitigated))
+    if not na(z.ceLn)
+        line.set_color(z.ceLn, color.new(f_zoneColor(z.kind, z.bullish, z.mitigated), 50))
+
+f_deleteZone(Zone z) =>
+    if not na(z.bx)
+        box.delete(z.bx)
+    if not na(z.ceLn)
+        line.delete(z.ceLn)
+
+// FIFO trim: remove oldest until size <= max
+f_trim(array<Zone> arr, int maxN) =>
+    while array.size(arr) > maxN
+        Zone z0 = array.shift(arr)
+        f_deleteZone(z0)
+
+// =============================================================================
+// STATE
+// =============================================================================
+
+var array<Zone> fvgs     = array.new<Zone>()
+var array<Zone> obs      = array.new<Zone>()
+var array<Zone> breakers = array.new<Zone>()
+
+// Track last swing high / low for MSS detection (used by Breaker logic)
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+if barstate.isconfirmed
+    // 3-bar fractal: candidate at offset 2, confirmed by bars at offset 1 and 3
+    bool sh = high[2] > high[1] and high[2] > high[3]
+    bool sl = low[2]  < low[1]  and low[2]  < low[3]
+    if sh
+        lastSwingHigh := high[2]
+    if sl
+        lastSwingLow := low[2]
+
+// =============================================================================
+// DETECTION
+// =============================================================================
+
+// --- FVG ---
+bool bullFvgNew = low > high[2]
+bool bearFvgNew = high < low[2]
+float bullFvgTop = low
+float bullFvgBot = high[2]
+float bearFvgTop = low[2]
+float bearFvgBot = high
+
+// ATR filter
+float atr14 = ta.atr(14)
+if bullFvgNew and fvgAtrFilter > 0.0 and (bullFvgTop - bullFvgBot) < fvgAtrFilter * atr14
+    bullFvgNew := false
+if bearFvgNew and fvgAtrFilter > 0.0 and (bearFvgTop - bearFvgBot) < fvgAtrFilter * atr14
+    bearFvgNew := false
+
+if barstate.isconfirmed and showBullFvg and bullFvgNew and f_passBias(true)
+    z = Zone.new(bullFvgTop, bullFvgBot, bar_index - 2, true, "FVG")
+    z := f_drawZone(z)
+    array.push(fvgs, z)
+    if alertNewFvg
+        alert("Bull FVG @ " + syminfo.ticker + " " + str.tostring(close), alert.freq_once_per_bar_close)
+
+if barstate.isconfirmed and showBearFvg and bearFvgNew and f_passBias(false)
+    z = Zone.new(bearFvgTop, bearFvgBot, bar_index - 2, false, "FVG")
+    z := f_drawZone(z)
+    array.push(fvgs, z)
+    if alertNewFvg
+        alert("Bear FVG @ " + syminfo.ticker + " " + str.tostring(close), alert.freq_once_per_bar_close)
+
+// --- OB ---
+float minBody = obDisplacement * atr14
+bool isImpUp   = close > open and math.abs(close - open) >= minBody
+bool isImpDown = close < open and math.abs(close - open) >= minBody
+
+if barstate.isconfirmed and showBullOB and isImpUp and f_passBias(true)
+    for i = 1 to obLookback
+        if close[i] < open[i]
+            z = Zone.new(high[i], low[i], bar_index - i, true, "OB")
+            z := f_drawZone(z)
+            array.push(obs, z)
+            if alertNewOB
+                alert("Bull OB @ " + syminfo.ticker + " " + str.tostring(close), alert.freq_once_per_bar_close)
+            break
+
+if barstate.isconfirmed and showBearOB and isImpDown and f_passBias(false)
+    for i = 1 to obLookback
+        if close[i] > open[i]
+            z = Zone.new(high[i], low[i], bar_index - i, false, "OB")
+            z := f_drawZone(z)
+            array.push(obs, z)
+            if alertNewOB
+                alert("Bear OB @ " + syminfo.ticker + " " + str.tostring(close), alert.freq_once_per_bar_close)
+            break
+
+// =============================================================================
+// MITIGATION & INVALIDATION (PER ZONE)
+// =============================================================================
+
+// Walk zones in DESCENDING index order so removal during iteration
+// stays consistent. Pine v6 allows `by -1`, but we use explicit descending
+// math for portability.
+if array.size(fvgs) > 0
+    int nFvg = array.size(fvgs)
+    for k = 0 to nFvg - 1
+        int i = nFvg - 1 - k
+        if i >= array.size(fvgs)
+            continue
+        Zone z = array.get(fvgs, i)
+        if not z.invalidated
+            if not z.mitigated and f_mitigated(z, mitFvgRule)
+                z.mitigated := true
+                f_refreshZone(z)
+                if alertMitig
+                    alert("FVG mitigated @ " + syminfo.ticker, alert.freq_once_per_bar_close)
+            if f_invalidated(z)
+                z.invalidated := true
+                if deleteInvalid
+                    f_deleteZone(z)
+                    array.remove(fvgs, i)
+
+if array.size(obs) > 0
+    int nOb = array.size(obs)
+    for k = 0 to nOb - 1
+        int i = nOb - 1 - k
+        if i >= array.size(obs)
+            continue
+        Zone z = array.get(obs, i)
+        if not z.invalidated
+            if not z.mitigated and f_mitigated(z, obMitigationRule)
+                z.mitigated := true
+                f_refreshZone(z)
+                if alertMitig
+                    alert("OB mitigated @ " + syminfo.ticker, alert.freq_once_per_bar_close)
+            // Breaker promotion: an OB that gets fully invalidated becomes a candidate breaker
+            if f_invalidated(z)
+                z.invalidated := true
+                if showBreaker
+                    bool mssOk = brkRequireMSS ?
+                       (z.bullish ? close < nz(lastSwingLow, low) : close > nz(lastSwingHigh, high)) :
+                       true
+                    if mssOk
+                        // Flip role: bullish OB violated → becomes bearish breaker (resistance)
+                        bz = Zone.new(z.top, z.bot, bar_index, not z.bullish, "BRK")
+                        bz := f_drawZone(bz)
+                        array.push(breakers, bz)
+                        if alertNewBrk
+                            alert((not z.bullish ? "Bullish" : "Bearish") + " Breaker @ " + syminfo.ticker, alert.freq_once_per_bar_close)
+                if deleteInvalid
+                    f_deleteZone(z)
+                    array.remove(obs, i)
+
+if array.size(breakers) > 0
+    int nBrk = array.size(breakers)
+    for k = 0 to nBrk - 1
+        int i = nBrk - 1 - k
+        if i >= array.size(breakers)
+            continue
+        Zone z = array.get(breakers, i)
+        if not z.invalidated
+            if not z.mitigated and f_mitigated(z, "wick")
+                z.mitigated := true
+                f_refreshZone(z)
+                if alertMitig
+                    alert("Breaker mitigated @ " + syminfo.ticker, alert.freq_once_per_bar_close)
+            if f_invalidated(z)
+                z.invalidated := true
+                if deleteInvalid
+                    f_deleteZone(z)
+                    array.remove(breakers, i)
+
+// =============================================================================
+// PRUNE
+// =============================================================================
+f_trim(fvgs,     maxFvg)
+f_trim(obs,      maxOB)
+f_trim(breakers, maxBrk)
+
+// =============================================================================
+// ALERT CONDITIONS (also available via alertcondition for dropdown UI)
+// =============================================================================
+alertcondition(bullFvgNew, "Bull FVG formed", "Bull FVG @ {{ticker}} {{close}}")
+alertcondition(bearFvgNew, "Bear FVG formed", "Bear FVG @ {{ticker}} {{close}}")
+alertcondition(isImpUp,    "Bull OB candidate", "Bull OB candidate @ {{ticker}} {{close}}")
+alertcondition(isImpDown,  "Bear OB candidate", "Bear OB candidate @ {{ticker}} {{close}}")
