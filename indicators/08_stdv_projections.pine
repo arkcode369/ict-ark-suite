@@ -1,0 +1,316 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | STDV Projections (Devil's Mark / MMBM / MMSM)
+// -----------------------------------------------------------------------------
+// File:        indicators/08_stdv_projections.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concepts:    docs/concepts/concept-monsterlab.md
+//                - STDV theory (project ranges using std-dev multiples)
+//                - Devil's Mark (equilibrium / 50% of dealer range)
+//                - PO3 + STDV synergy
+//              docs/concepts/concept-ipda-mmxm.md
+//                - MMBM / MMSM curve (Buy / Sell model)
+//                - STDV projection from IPDA lookback
+//              docs/concepts/concept-crt.md
+//                - STDV from CRT C1 range
+//              docs/concepts/concept-foundation-model.md
+//                - STDV from key range (Asia / Dealer / prev-day)
+//
+// Drawn:
+//   Reference range (user-selected source: prev day, Asia session, NY AM session,
+//     user-defined, or rolling N-bar) → projection lines at:
+//       -2.0, -1.5, -1.0, -0.5, 0 (Devil's Mark / equilibrium),
+//       +0.5, +1.0, +1.5, +2.0, +2.5, +4.0 STDV multiples.
+//
+//   MMBM / MMSM polarity hint: bullish polarity (price > equilibrium 80% of last
+//   N bars) → MMBM tag; reverse → MMSM tag.
+//
+// Repaint policy: range source updates each session/bar boundary; projection
+//   lines re-anchor at that point. Levels never repaint within a single
+//   reference cycle.
+// =============================================================================
+
+indicator(
+     "ICT/SMC Suite | STDV Projections",
+     shorttitle = "ICT-STDV",
+     overlay = true,
+     max_lines_count = 500,
+     max_labels_count = 500
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_SRC    = "Reference Range Source"
+G_LVL    = "Projection Levels"
+G_DEV    = "Devil's Mark / Polarity"
+G_DISP   = "Display"
+G_ALERT  = "Alerts"
+
+src = input.string("prev_day",
+        "Reference range",
+        options = ["prev_day", "asia_session", "ny_am_session", "rolling_N"],
+        group = G_SRC)
+rollingN = input.int(20, "Rolling N (when src=rolling_N)",
+                     minval = 5, maxval = 200, group = G_SRC)
+
+showNeg2  = input.bool(true, "−2.0 STDV", group = G_LVL)
+showNeg15 = input.bool(true, "−1.5 STDV", group = G_LVL)
+showNeg1  = input.bool(true, "−1.0 STDV (low / sell-side)", group = G_LVL)
+showNeg05 = input.bool(true, "−0.5 STDV", group = G_LVL)
+showZero  = input.bool(true, "0 STDV (Devil's Mark / equilibrium)", group = G_LVL)
+showPos05 = input.bool(true, "+0.5 STDV", group = G_LVL)
+showPos1  = input.bool(true, "+1.0 STDV (high / buy-side)", group = G_LVL)
+showPos15 = input.bool(true, "+1.5 STDV", group = G_LVL)
+showPos2  = input.bool(true, "+2.0 STDV", group = G_LVL)
+showPos25 = input.bool(false, "+2.5 STDV", group = G_LVL)
+showPos4  = input.bool(false, "+4.0 STDV (extreme)", group = G_LVL)
+
+colHL  = input.color(color.new(color.white,    0), "−1 / +1 (range)",       group = G_LVL, inline = "c1")
+colMid = input.color(color.new(color.yellow,   0), "Devil's Mark (0)",      group = G_LVL, inline = "c1")
+colExt = input.color(color.new(color.aqua,    20), "±0.5",                  group = G_LVL, inline = "c2")
+colPj  = input.color(color.new(color.fuchsia, 30), "±1.5 / ±2 / ±2.5 / ±4", group = G_LVL, inline = "c2")
+
+showPolarity = input.bool(true, "Show MMBM / MMSM polarity tag", group = G_DEV)
+polWindow    = input.int(20, "Polarity window (bars)",
+                         minval = 5, maxval = 200, group = G_DEV)
+polThresh    = input.float(0.6, "Polarity threshold (fraction of bars > mid)",
+                           minval = 0.51, maxval = 0.95, step = 0.01, group = G_DEV)
+
+extendRight = input.bool(true, "Extend projection lines right", group = G_DISP)
+labelOnRight = input.bool(true, "Show level labels at right edge", group = G_DISP)
+
+alertCross = input.bool(true, "Alert when price crosses Devil's Mark", group = G_ALERT)
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+f_inSess(string sess) =>
+    not na(time(timeframe.period, sess, "America/New_York"))
+
+f_sessStart(string sess) =>
+    bool inNow  = not na(time(timeframe.period, sess, "America/New_York"))
+    bool inPrev = not na(time(timeframe.period, sess, "America/New_York")[1])
+    inNow and not inPrev
+
+f_sessEnd(string sess) =>
+    bool inNow  = not na(time(timeframe.period, sess, "America/New_York"))
+    bool inPrev = not na(time(timeframe.period, sess, "America/New_York")[1])
+    not inNow and inPrev
+
+// =============================================================================
+// REFERENCE RANGE STATE
+// =============================================================================
+
+var float refH = na
+var float refL = na
+var int   refStart = na
+
+// Track current session high/low; finalize on session end / new day
+var float curH = na
+var float curL = na
+var int   curStart = na
+
+// --- Per-source logic ---
+[prevDayH, prevDayL] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1]], lookahead = barmerge.lookahead_off)
+
+// Asia session 20:00–24:00 NY
+asiaStart = f_sessStart("2000-2400:23456")
+asiaEnd   = f_sessEnd("2000-2400:23456")
+asiaIn    = f_inSess("2000-2400:23456")
+
+// NY AM session 07:00–10:00 NY
+nyamStart = f_sessStart("0700-1000:23456")
+nyamEnd   = f_sessEnd("0700-1000:23456")
+nyamIn    = f_inSess("0700-1000:23456")
+
+if src == "prev_day"
+    refH := prevDayH
+    refL := prevDayL
+    refStart := bar_index
+
+if src == "asia_session"
+    if asiaStart
+        curH := high
+        curL := low
+        curStart := bar_index
+    else if asiaIn
+        curH := math.max(curH, high)
+        curL := math.min(curL, low)
+    if asiaEnd and not na(curStart)
+        refH := curH
+        refL := curL
+        refStart := curStart
+
+if src == "ny_am_session"
+    if nyamStart
+        curH := high
+        curL := low
+        curStart := bar_index
+    else if nyamIn
+        curH := math.max(curH, high)
+        curL := math.min(curL, low)
+    if nyamEnd and not na(curStart)
+        refH := curH
+        refL := curL
+        refStart := curStart
+
+if src == "rolling_N"
+    refH := ta.highest(high, rollingN)
+    refL := ta.lowest(low,  rollingN)
+    refStart := bar_index - rollingN
+
+// =============================================================================
+// PROJECTION LINES
+// -----------------------------------------------------------------------------
+// We hold one set of lines per level; on every bar where ref changes, we just
+// update the y-coords (cheap). On range-source change, we delete & rebuild.
+// =============================================================================
+
+var line ln_n2  = na
+var line ln_n15 = na
+var line ln_n1  = na
+var line ln_n05 = na
+var line ln_z   = na
+var line ln_p05 = na
+var line ln_p1  = na
+var line ln_p15 = na
+var line ln_p2  = na
+var line ln_p25 = na
+var line ln_p4  = na
+
+var label lb_n2  = na
+var label lb_n15 = na
+var label lb_n1  = na
+var label lb_n05 = na
+var label lb_z   = na
+var label lb_p05 = na
+var label lb_p1  = na
+var label lb_p15 = na
+var label lb_p2  = na
+var label lb_p25 = na
+var label lb_p4  = na
+
+f_priceAt(float lvl) =>
+    float dev = refH - refL
+    float mid = math.avg(refH, refL)
+    mid + dev * lvl * 0.5
+    // Note: lvl is expressed in "STDV units" where 1 unit == half-range from mid.
+    // Therefore: ±1 STDV corresponds to refH/refL respectively.
+
+f_setLnLb(line ln, label lb, float price, color c, string txt, bool show) =>
+    line outLn = ln
+    label outLb = lb
+    if show and not na(price)
+        if na(outLn)
+            outLn := line.new(refStart, price, bar_index, price,
+                 color = c,
+                 style = line.style_solid,
+                 extend = extendRight ? extend.right : extend.none)
+        else
+            line.set_xy1(outLn, refStart, price)
+            line.set_xy2(outLn, bar_index, price)
+            line.set_color(outLn, c)
+        if labelOnRight
+            if na(outLb)
+                outLb := label.new(bar_index, price, txt,
+                     color = color.new(c, 80),
+                     textcolor = c,
+                     style = label.style_label_left,
+                     size = size.tiny)
+            else
+                label.set_xy(outLb, bar_index, price)
+                label.set_color(outLb, color.new(c, 80))
+                label.set_textcolor(outLb, c)
+                label.set_text(outLb, txt)
+    else
+        if not na(outLn)
+            line.delete(outLn)
+            outLn := na
+        if not na(outLb)
+            label.delete(outLb)
+            outLb := na
+    [outLn, outLb]
+
+if not na(refH) and not na(refL) and refH > refL
+    [a1, b1] = f_setLnLb(ln_n2,  lb_n2,  f_priceAt(-2.0), colPj,  "−2.0",   showNeg2)
+    ln_n2  := a1
+    lb_n2  := b1
+    [a2, b2] = f_setLnLb(ln_n15, lb_n15, f_priceAt(-1.5), colPj,  "−1.5",   showNeg15)
+    ln_n15 := a2
+    lb_n15 := b2
+    [a3, b3] = f_setLnLb(ln_n1,  lb_n1,  f_priceAt(-1.0), colHL,  "−1.0",   showNeg1)
+    ln_n1  := a3
+    lb_n1  := b3
+    [a4, b4] = f_setLnLb(ln_n05, lb_n05, f_priceAt(-0.5), colExt, "−0.5",   showNeg05)
+    ln_n05 := a4
+    lb_n05 := b4
+    [a5, b5] = f_setLnLb(ln_z,   lb_z,   f_priceAt(0.0),  colMid, "Devil",  showZero)
+    ln_z   := a5
+    lb_z   := b5
+    [a6, b6] = f_setLnLb(ln_p05, lb_p05, f_priceAt(0.5),  colExt, "+0.5",   showPos05)
+    ln_p05 := a6
+    lb_p05 := b6
+    [a7, b7] = f_setLnLb(ln_p1,  lb_p1,  f_priceAt(1.0),  colHL,  "+1.0",   showPos1)
+    ln_p1  := a7
+    lb_p1  := b7
+    [a8, b8] = f_setLnLb(ln_p15, lb_p15, f_priceAt(1.5),  colPj,  "+1.5",   showPos15)
+    ln_p15 := a8
+    lb_p15 := b8
+    [a9, b9] = f_setLnLb(ln_p2,  lb_p2,  f_priceAt(2.0),  colPj,  "+2.0",   showPos2)
+    ln_p2  := a9
+    lb_p2  := b9
+    [a10, b10] = f_setLnLb(ln_p25, lb_p25, f_priceAt(2.5), colPj, "+2.5",   showPos25)
+    ln_p25 := a10
+    lb_p25 := b10
+    [a11, b11] = f_setLnLb(ln_p4,  lb_p4,  f_priceAt(4.0), colPj, "+4.0",   showPos4)
+    ln_p4  := a11
+    lb_p4  := b11
+
+// =============================================================================
+// MMBM / MMSM POLARITY TAG
+// =============================================================================
+
+var label polLabel = na
+
+if showPolarity and not na(refH) and not na(refL)
+    float mid = math.avg(refH, refL)
+    int aboveCount = 0
+    for i = 0 to math.min(polWindow - 1, bar_index)
+        if close[i] > mid
+            aboveCount += 1
+    float frac = polWindow > 0 ? aboveCount / float(polWindow) : 0.0
+    string tag = frac >= polThresh ? "MMBM (Bullish polarity)"
+                 : frac <= 1.0 - polThresh ? "MMSM (Bearish polarity)"
+                 : "Neutral"
+    color cc = frac >= polThresh ? color.green
+              : frac <= 1.0 - polThresh ? color.red
+              : color.gray
+    if na(polLabel)
+        polLabel := label.new(bar_index, mid, tag,
+             color = color.new(cc, 60),
+             textcolor = color.white,
+             style = label.style_label_left,
+             size = size.small)
+    else
+        label.set_xy(polLabel, bar_index, mid)
+        label.set_text(polLabel, tag)
+        label.set_color(polLabel, color.new(cc, 60))
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+
+float midForAlert = na(refH) or na(refL) ? na : math.avg(refH, refL)
+bool crossedDevil = not na(midForAlert) and not na(midForAlert[1]) and
+                    ((close > midForAlert and close[1] <= midForAlert[1]) or
+                     (close < midForAlert and close[1] >= midForAlert[1]))
+
+if alertCross and crossedDevil
+    alert("Devil's Mark cross @ " + str.tostring(close), alert.freq_once_per_bar_close)
+
+alertcondition(crossedDevil, "Devil's Mark cross", "Devil's Mark cross @ {{ticker}}")
