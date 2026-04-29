@@ -1,0 +1,370 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | Liquidity & Inducement (LIT)
+// -----------------------------------------------------------------------------
+// File:        indicators/02_liquidity.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concepts:    docs/concepts/concept-logic.md
+//                - Buy Side & Sell Side Liquidity (BSL / SSL)
+//                - High & Low Resistance Liquidity (HRL / LRL)
+//                - Internal & External Range Liquidity (IRL / ERL)
+//                - Liquidity Pool / Liquidity Sweep & Liquidity Run
+//              docs/concepts/concept-lit.md
+//                - Inducement Major / Medium / Minor
+//                - LIT Cycle, False BOS, IRL→ERL flow
+//              docs/concepts/concept-monsterlab.md
+//                - IOF (Institutional Order Flow) directional bias
+//
+// Detected:
+//   - Swing-based BSL (above) and SSL (below)
+//   - Equal Highs / Equal Lows (within ATR tolerance)
+//   - Liquidity Sweep (wick through level + close back inside)
+//   - Inducement classification: Minor (small swing) / Medium (mid swing) /
+//     Major (large swing) — driven by 3 independent swing lookbacks
+//   - IRL vs ERL relative to a user-anchored dealing range
+//
+// Repaint policy:
+//   - Swings: confirmed `lookback` bars after the candidate; lines/labels
+//     placed only after confirmation.
+//   - Sweep events: never repaint (real-time detection on wick close).
+//   - Equal H/L grouping: stable once both swings confirmed.
+// =============================================================================
+
+indicator(
+     "ICT/SMC Suite | Liquidity",
+     shorttitle = "ICT-LIQ",
+     overlay = true,
+     max_boxes_count = 100,
+     max_lines_count = 500,
+     max_labels_count = 500
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_DISP   = "Display"
+G_SWING  = "Swings & Inducement"
+G_EQ     = "Equal H/L"
+G_SWEEP  = "Sweep / Run"
+G_RANGE  = "Dealing Range (IRL/ERL)"
+G_FILT   = "Filter"
+G_ALERT  = "Alerts"
+
+// --- Display ---
+showBSL    = input.bool(true,  "Show BSL (buy side liquidity)",  group = G_DISP)
+showSSL    = input.bool(true,  "Show SSL (sell side liquidity)", group = G_DISP)
+showEqual  = input.bool(true,  "Show Equal H/L",                  group = G_DISP)
+showSweep  = input.bool(true,  "Show Sweep events",               group = G_DISP)
+showRange  = input.bool(true,  "Show dealing range (IRL/ERL)",   group = G_DISP)
+
+colMinor   = input.color(color.new(color.gray,    50), "Minor",  group = G_DISP, inline = "ind")
+colMedium  = input.color(color.new(color.blue,    30), "Medium", group = G_DISP, inline = "ind")
+colMajor   = input.color(color.new(color.red,     10), "Major",  group = G_DISP, inline = "ind")
+colEq      = input.color(color.new(color.orange,  20), "Equal H/L color", group = G_DISP)
+colSweep   = input.color(color.new(color.fuchsia,  0), "Sweep color",      group = G_DISP)
+colERL     = input.color(color.new(color.yellow,  85), "ERL bg",          group = G_DISP)
+colIRL     = input.color(color.new(color.aqua,    90), "IRL bg",          group = G_DISP)
+
+extendRight = input.bool(true, "Extend liquidity lines to current bar", group = G_DISP)
+maxLines    = input.int(40, "Max liquidity lines kept (per side)",
+                         minval = 5, maxval = 200, group = G_DISP)
+
+// --- Swings & Inducement ---
+swingMinor  = input.int(3,  "Minor swing lookback",  minval = 2, maxval = 10, group = G_SWING)
+swingMedium = input.int(8,  "Medium swing lookback", minval = 3, maxval = 30, group = G_SWING)
+swingMajor  = input.int(20, "Major swing lookback",  minval = 5, maxval = 80, group = G_SWING)
+
+// --- Equal H/L ---
+eqTol = input.float(0.10, "Equal H/L tolerance (× ATR14)",
+                    minval = 0.0, step = 0.01, group = G_EQ)
+
+// --- Sweep ---
+sweepWickFrac = input.float(0.5,
+                  "Sweep wick fraction (wick must be ≥ this × bar range)",
+                  minval = 0.1, maxval = 1.0, step = 0.05, group = G_SWEEP)
+
+// --- Dealing range ---
+rangeBars = input.int(50, "Dealing-range lookback (bars for highest/lowest)",
+                      minval = 10, maxval = 500, group = G_RANGE)
+
+// --- Filter ---
+hideSwept = input.bool(false, "Hide swept lines (delete after sweep)",
+                       group = G_FILT)
+
+// --- Alerts ---
+alertNewBSL  = input.bool(true,  "Alert on new BSL",   group = G_ALERT)
+alertNewSSL  = input.bool(true,  "Alert on new SSL",   group = G_ALERT)
+alertSwept   = input.bool(true,  "Alert on sweep",     group = G_ALERT)
+alertEqual   = input.bool(true,  "Alert on Equal H/L", group = G_ALERT)
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+type Liq
+    float  price
+    int    bar
+    string side       // "BSL" | "SSL"
+    string size       // "minor" | "medium" | "major"
+    bool   swept     = false
+    bool   equal     = false        // marked equal with another Liq
+    line   ln        = na
+    label  lb        = na
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+f_atr14() => ta.atr(14)
+
+f_levelColor(string sz) =>
+    switch sz
+        "minor"  => colMinor
+        "medium" => colMedium
+        "major"  => colMajor
+        =>          colMinor
+
+// 3-bar fractal swing detector (returns true if bar at offset = LB is swing)
+f_isSwingHigh(simple int lb) =>
+    bool result = true
+    float candidate = high[lb]
+    for i = 0 to lb * 2
+        if i != lb and high[i] > candidate
+            result := false
+            break
+    result
+
+f_isSwingLow(simple int lb) =>
+    bool result = true
+    float candidate = low[lb]
+    for i = 0 to lb * 2
+        if i != lb and low[i] < candidate
+            result := false
+            break
+    result
+
+f_drawLiq(Liq lq) =>
+    color c = f_levelColor(lq.size)
+    int rightBar = bar_index
+    line ln = line.new(lq.bar, lq.price, rightBar, lq.price,
+         color = c,
+         style = line.style_dashed,
+         width = lq.size == "major" ? 2 : 1,
+         extend = extendRight ? extend.right : extend.none)
+    string txt = lq.side + " " + lq.size
+    label lb = label.new(rightBar, lq.price, txt,
+         color = color.new(c, 80),
+         textcolor = color.white,
+         style = lq.side == "BSL" ? label.style_label_left : label.style_label_left,
+         size = size.tiny)
+    lq.ln := ln
+    lq.lb := lb
+    lq
+
+f_markSwept(Liq lq) =>
+    if not na(lq.ln)
+        line.set_color(lq.ln, color.new(colSweep, 30))
+        line.set_style(lq.ln, line.style_dotted)
+    if not na(lq.lb)
+        label.set_text(lq.lb, lq.side + " " + lq.size + " SWEPT")
+        label.set_color(lq.lb, color.new(colSweep, 0))
+    lq
+
+f_deleteLiq(Liq lq) =>
+    if not na(lq.ln)
+        line.delete(lq.ln)
+    if not na(lq.lb)
+        label.delete(lq.lb)
+
+f_trimLiq(array<Liq> arr, int maxN) =>
+    while array.size(arr) > maxN
+        Liq z0 = array.shift(arr)
+        f_deleteLiq(z0)
+
+// Returns sweep direction or "" if no sweep on current bar vs the level
+f_sweepDir(Liq lq) =>
+    bool atTop = lq.side == "BSL"
+    string dir = ""
+    if atTop
+        // Wick through level + close back below
+        if high > lq.price and close < lq.price
+            float bodyTop = math.max(open, close)
+            float wickTop = high - bodyTop
+            float barRng  = high - low
+            if barRng > 0 and wickTop / barRng >= sweepWickFrac
+                dir := "BSL_swept"
+    else
+        if low < lq.price and close > lq.price
+            float bodyBot = math.min(open, close)
+            float wickBot = bodyBot - low
+            float barRng  = high - low
+            if barRng > 0 and wickBot / barRng >= sweepWickFrac
+                dir := "SSL_swept"
+    dir
+
+// =============================================================================
+// STATE
+// =============================================================================
+
+var array<Liq> bsls = array.new<Liq>()
+var array<Liq> ssls = array.new<Liq>()
+var box rangeBox = na
+
+float atrV = f_atr14()
+
+// =============================================================================
+// SWING / INDUCEMENT DETECTION
+// =============================================================================
+
+if barstate.isconfirmed
+    // --- Major swings (highest priority) ---
+    if showBSL and f_isSwingHigh(swingMajor)
+        Liq lq = Liq.new(high[swingMajor], bar_index - swingMajor, "BSL", "major")
+        if showBSL
+            lq := f_drawLiq(lq)
+            array.push(bsls, lq)
+            if alertNewBSL
+                alert("New Major BSL @ " + str.tostring(lq.price), alert.freq_once_per_bar_close)
+    if showSSL and f_isSwingLow(swingMajor)
+        Liq lq = Liq.new(low[swingMajor], bar_index - swingMajor, "SSL", "major")
+        if showSSL
+            lq := f_drawLiq(lq)
+            array.push(ssls, lq)
+            if alertNewSSL
+                alert("New Major SSL @ " + str.tostring(lq.price), alert.freq_once_per_bar_close)
+
+    // --- Medium swings (skipped if same bar already detected as major) ---
+    if showBSL and f_isSwingHigh(swingMedium) and not f_isSwingHigh(swingMajor)
+        Liq lq = Liq.new(high[swingMedium], bar_index - swingMedium, "BSL", "medium")
+        lq := f_drawLiq(lq)
+        array.push(bsls, lq)
+        if alertNewBSL
+            alert("New Medium BSL @ " + str.tostring(lq.price), alert.freq_once_per_bar_close)
+    if showSSL and f_isSwingLow(swingMedium) and not f_isSwingLow(swingMajor)
+        Liq lq = Liq.new(low[swingMedium], bar_index - swingMedium, "SSL", "medium")
+        lq := f_drawLiq(lq)
+        array.push(ssls, lq)
+        if alertNewSSL
+            alert("New Medium SSL @ " + str.tostring(lq.price), alert.freq_once_per_bar_close)
+
+    // --- Minor swings ---
+    if showBSL and f_isSwingHigh(swingMinor) and not f_isSwingHigh(swingMedium) and not f_isSwingHigh(swingMajor)
+        Liq lq = Liq.new(high[swingMinor], bar_index - swingMinor, "BSL", "minor")
+        lq := f_drawLiq(lq)
+        array.push(bsls, lq)
+    if showSSL and f_isSwingLow(swingMinor) and not f_isSwingLow(swingMedium) and not f_isSwingLow(swingMajor)
+        Liq lq = Liq.new(low[swingMinor], bar_index - swingMinor, "SSL", "minor")
+        lq := f_drawLiq(lq)
+        array.push(ssls, lq)
+
+// =============================================================================
+// EQUAL H/L DETECTION
+// =============================================================================
+
+if showEqual and array.size(bsls) >= 2
+    Liq newest = array.get(bsls, array.size(bsls) - 1)
+    Liq prior  = array.get(bsls, array.size(bsls) - 2)
+    if math.abs(newest.price - prior.price) <= eqTol * atrV
+        if not newest.equal
+            newest.equal := true
+            if not na(newest.lb)
+                label.set_text(newest.lb, "EQH")
+                label.set_color(newest.lb, color.new(colEq, 50))
+                label.set_textcolor(newest.lb, color.black)
+            if not na(prior.lb)
+                label.set_text(prior.lb, "EQH")
+                label.set_color(prior.lb, color.new(colEq, 50))
+                label.set_textcolor(prior.lb, color.black)
+            if alertEqual
+                alert("Equal Highs @ " + str.tostring(newest.price), alert.freq_once_per_bar_close)
+
+if showEqual and array.size(ssls) >= 2
+    Liq newest = array.get(ssls, array.size(ssls) - 1)
+    Liq prior  = array.get(ssls, array.size(ssls) - 2)
+    if math.abs(newest.price - prior.price) <= eqTol * atrV
+        if not newest.equal
+            newest.equal := true
+            if not na(newest.lb)
+                label.set_text(newest.lb, "EQL")
+                label.set_color(newest.lb, color.new(colEq, 50))
+                label.set_textcolor(newest.lb, color.black)
+            if not na(prior.lb)
+                label.set_text(prior.lb, "EQL")
+                label.set_color(prior.lb, color.new(colEq, 50))
+                label.set_textcolor(prior.lb, color.black)
+            if alertEqual
+                alert("Equal Lows @ " + str.tostring(newest.price), alert.freq_once_per_bar_close)
+
+// =============================================================================
+// SWEEP DETECTION (per active liquidity)
+// =============================================================================
+
+f_walkAndSweep(array<Liq> arr) =>
+    if array.size(arr) > 0
+        int n = array.size(arr)
+        for k = 0 to n - 1
+            int i = n - 1 - k
+            if i >= array.size(arr)
+                continue
+            Liq lq = array.get(arr, i)
+            if not lq.swept
+                string dir = f_sweepDir(lq)
+                if dir != ""
+                    lq.swept := true
+                    lq := f_markSwept(lq)
+                    if alertSwept
+                        alert(lq.side + " " + lq.size + " swept @ " + str.tostring(lq.price),
+                              alert.freq_once_per_bar_close)
+                    if hideSwept
+                        f_deleteLiq(lq)
+                        array.remove(arr, i)
+
+f_walkAndSweep(bsls)
+f_walkAndSweep(ssls)
+
+// Update right edge of lines/labels each bar to follow price
+if extendRight
+    if array.size(bsls) > 0
+        for j = 0 to array.size(bsls) - 1
+            Liq lq = array.get(bsls, j)
+            if not na(lq.lb)
+                label.set_x(lq.lb, bar_index)
+    if array.size(ssls) > 0
+        for j = 0 to array.size(ssls) - 1
+            Liq lq = array.get(ssls, j)
+            if not na(lq.lb)
+                label.set_x(lq.lb, bar_index)
+
+f_trimLiq(bsls, maxLines)
+f_trimLiq(ssls, maxLines)
+
+// =============================================================================
+// DEALING RANGE (IRL / ERL)
+// =============================================================================
+// Dealing range = highest high / lowest low over `rangeBars` bars.
+// ERL = the high & the low (range extremes).
+// IRL = anything in between (we simply tint the box and let user infer).
+// Equilibrium = midpoint (50%).
+
+if showRange
+    float rngH = ta.highest(high, rangeBars)
+    float rngL = ta.lowest(low, rangeBars)
+    int leftBar = bar_index - rangeBars + 1
+    if barstate.islast
+        if not na(rangeBox)
+            box.delete(rangeBox)
+        rangeBox := box.new(leftBar, rngH, bar_index, rngL,
+                            border_color = color.new(colERL, 30),
+                            border_width = 1,
+                            bgcolor = colIRL,
+                            extend = extend.none)
+
+// =============================================================================
+// ALERT CONDITIONS (dropdown)
+// =============================================================================
+alertcondition(barstate.isconfirmed and f_isSwingHigh(swingMajor),
+               "Major BSL formed", "Major BSL @ {{ticker}} {{close}}")
+alertcondition(barstate.isconfirmed and f_isSwingLow(swingMajor),
+               "Major SSL formed", "Major SSL @ {{ticker}} {{close}}")
