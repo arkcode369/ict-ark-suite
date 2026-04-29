@@ -1,0 +1,241 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | Quarterly Theory
+// -----------------------------------------------------------------------------
+// File:        indicators/05_quarterly_theory.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concepts:    docs/concepts/concept-quarterly-theory.md
+//                - Q1-Q4 AMD / XAMD / AMDX cycles (Yearly, Monthly, Weekly,
+//                  Daily, Session, Micro)
+//                - True Opens hierarchy (Year, Month, Week, Day, Session, Micro)
+//                - DFR (Defining Range) — placeholder, see notes
+//                - sSMT — multi-asset, not implemented in v0.1 (see ROADMAP)
+//
+// Drawn:
+//   - Daily Q1–Q4 boundaries (6-hour quarters in NY tz):
+//       Q1: 18:00–00:00 (prev day, Accumulation),
+//       Q2: 00:00–06:00 (Manipulation),
+//       Q3: 06:00–12:00 (Distribution),
+//       Q4: 12:00–18:00 (Reversal/Continuation)
+//   - Session 90-min quarters (within each 6h block)
+//   - True Day Open (00:00 NY) horizontal
+//   - True Week Open (Sunday 18:00 NY / Monday 00:00 NY equivalent)
+//   - True Month Open (1st of month, NY 00:00)
+//   - True Year Open (April 1st, NY 00:00 — per QT, not Jan 1)
+//   - True Session Open (4 sessions: Asia 19:30, London 01:30, NY AM 07:30,
+//     NY PM 13:30)
+//
+// Repaint policy: NONE. All time-based.
+// =============================================================================
+
+indicator(
+     "ICT/SMC Suite | Quarterly Theory",
+     shorttitle = "ICT-QT",
+     overlay = true,
+     max_lines_count = 500,
+     max_labels_count = 500
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_QD     = "Daily Quarters"
+G_QS     = "Session Quarters (90m)"
+G_TO     = "True Opens"
+G_DISP   = "Display"
+
+showDQ   = input.bool(true,  "Show Daily Quarter boundaries (6h)", group = G_QD)
+showDQLb = input.bool(true,  "Show Q1/Q2/Q3/Q4 labels",            group = G_QD)
+colDQ    = input.color(color.new(color.aqua, 50), "Daily Quarter line", group = G_QD)
+
+showSQ   = input.bool(false, "Show Session Quarter boundaries (90m)", group = G_QS)
+colSQ    = input.color(color.new(color.silver, 60), "Session Quarter line", group = G_QS)
+
+showTDO  = input.bool(true,  "True Day Open (00:00 NY)",          group = G_TO)
+showTWO  = input.bool(true,  "True Week Open (Mon 00:00 NY)",     group = G_TO)
+showTMO  = input.bool(true,  "True Month Open (1st of month)",    group = G_TO)
+showTYO  = input.bool(true,  "True Year Open (April 1st)",        group = G_TO)
+showTSO  = input.bool(true,  "True Session Opens (4 sessions)",   group = G_TO)
+
+colTDO = input.color(color.new(color.yellow,  0), "TDO color", group = G_TO, inline = "to1")
+colTWO = input.color(color.new(color.orange,  0), "TWO color", group = G_TO, inline = "to1")
+colTMO = input.color(color.new(color.fuchsia, 0), "TMO color", group = G_TO, inline = "to2")
+colTYO = input.color(color.new(color.red,     0), "TYO color", group = G_TO, inline = "to2")
+colTSO = input.color(color.new(color.aqua,   30), "TSO color", group = G_TO)
+
+extendOpens   = input.bool(true,  "Extend True Open lines to current bar", group = G_DISP)
+maxOpensKept  = input.int(20,
+                  "Max each True Open lines kept",
+                  minval = 2, maxval = 200, group = G_DISP)
+
+maxBars = input.int(2000, "Limit drawings to last N bars (0 = no limit)",
+                    minval = 0, maxval = 20000, group = G_DISP)
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+f_drawingAllowed() => maxBars == 0 or bar_index >= last_bar_index - maxBars
+
+f_isHourMin(int H, int M) =>
+    hour(time, "America/New_York") == H and minute(time, "America/New_York") == M
+
+f_isFirstBarOf(int H, int M) =>
+    bool nowMatch  = f_isHourMin(H, M)
+    bool prevMatch = hour(time[1], "America/New_York") == H and minute(time[1], "America/New_York") == M
+    nowMatch and not prevMatch
+
+// =============================================================================
+// STATE
+// =============================================================================
+
+type Lvl
+    float price
+    int   bar
+    string txt
+    color  c
+    line  ln
+    label lb
+
+var array<Lvl> tdoLines = array.new<Lvl>()
+var array<Lvl> twoLines = array.new<Lvl>()
+var array<Lvl> tmoLines = array.new<Lvl>()
+var array<Lvl> tyoLines = array.new<Lvl>()
+var array<Lvl> tsoLines = array.new<Lvl>()
+
+f_drawLvl(array<Lvl> arr, color c, string txt, int maxKeep) =>
+    if f_drawingAllowed()
+        line ln = line.new(bar_index, open, bar_index, open,
+             color = c,
+             style = line.style_solid,
+             width = 1,
+             extend = extendOpens ? extend.right : extend.none)
+        label lb = label.new(bar_index, open, txt,
+             color = color.new(c, 80),
+             textcolor = c,
+             style = label.style_label_left,
+             size = size.tiny)
+        Lvl l = Lvl.new(open, bar_index, txt, c, ln, lb)
+        array.push(arr, l)
+        while array.size(arr) > maxKeep
+            Lvl l0 = array.shift(arr)
+            if not na(l0.ln)
+                line.delete(l0.ln)
+            if not na(l0.lb)
+                label.delete(l0.lb)
+
+// =============================================================================
+// DAILY QUARTERS (Q1–Q4)
+// -----------------------------------------------------------------------------
+// Per QT canonical (Daniel concept-quarterly-theory.md):
+//   Q1 18:00 → 00:00 NY  (Accumulation,  prev-day evening)
+//   Q2 00:00 → 06:00 NY  (Manipulation, Asia)
+//   Q3 06:00 → 12:00 NY  (Distribution, London / NY AM)
+//   Q4 12:00 → 18:00 NY  (Reversal / Continuation, NY PM)
+// =============================================================================
+
+f_drawDQLine(int H, string txt) =>
+    if showDQ and f_isFirstBarOf(H, 0) and f_drawingAllowed()
+        line.new(bar_index, low - ta.atr(14) * 2, bar_index, high + ta.atr(14) * 2,
+             color = colDQ,
+             style = line.style_dashed,
+             extend = extend.none)
+        if showDQLb
+            label.new(bar_index, high + ta.atr(14) * 2, txt,
+                 color = color.new(colDQ, 70),
+                 textcolor = color.white,
+                 style = label.style_label_down,
+                 size = size.tiny)
+
+f_drawDQLine(18, "Q1")
+f_drawDQLine(0,  "Q2")
+f_drawDQLine(6,  "Q3")
+f_drawDQLine(12, "Q4")
+
+// =============================================================================
+// SESSION QUARTERS (90-min sub-quarters within each 6h block)
+// =============================================================================
+
+f_drawSQLine(int H, int M, string txt) =>
+    if showSQ and f_isFirstBarOf(H, M) and f_drawingAllowed()
+        line.new(bar_index, low - ta.atr(14), bar_index, high + ta.atr(14),
+             color = colSQ,
+             style = line.style_dotted,
+             extend = extend.none)
+
+// 90-min sub-quarters within Q2 (00:00–06:00): Q2.1 00:00, Q2.2 01:30, Q2.3 03:00, Q2.4 04:30
+f_drawSQLine(1,  30, "")
+f_drawSQLine(3,  0,  "")
+f_drawSQLine(4,  30, "")
+// Q3 (06:00–12:00): 07:30, 09:00, 10:30
+f_drawSQLine(7,  30, "")
+f_drawSQLine(9,  0,  "")
+f_drawSQLine(10, 30, "")
+// Q4 (12:00–18:00): 13:30, 15:00, 16:30
+f_drawSQLine(13, 30, "")
+f_drawSQLine(15, 0,  "")
+f_drawSQLine(16, 30, "")
+// Q1 (18:00–00:00): 19:30, 21:00, 22:30
+f_drawSQLine(19, 30, "")
+f_drawSQLine(21, 0,  "")
+f_drawSQLine(22, 30, "")
+
+// =============================================================================
+// TRUE OPENS
+// =============================================================================
+
+// --- TDO: 00:00 NY ---
+if showTDO and f_isFirstBarOf(0, 0)
+    f_drawLvl(tdoLines, colTDO, "TDO", maxOpensKept)
+
+// --- TWO: Sunday 18:00 NY (start of new week per ICT) ---
+bool isWeekStart = dayofweek(time, "America/New_York") == dayofweek.sunday and f_isHourMin(18, 0) and
+                   not (dayofweek(time[1], "America/New_York") == dayofweek.sunday and hour(time[1], "America/New_York") == 18 and minute(time[1], "America/New_York") == 0)
+if showTWO and isWeekStart
+    f_drawLvl(twoLines, colTWO, "TWO", maxOpensKept)
+
+// --- TMO: 1st day of month, 00:00 NY ---
+bool isMonthStart = dayofmonth(time, "America/New_York") == 1 and f_isFirstBarOf(0, 0)
+if showTMO and isMonthStart
+    f_drawLvl(tmoLines, colTMO, "TMO", maxOpensKept)
+
+// --- TYO: April 1st, 00:00 NY ---
+bool isYearStart = month(time, "America/New_York") == 4 and dayofmonth(time, "America/New_York") == 1 and f_isFirstBarOf(0, 0)
+if showTYO and isYearStart
+    f_drawLvl(tyoLines, colTYO, "TYO", maxOpensKept)
+
+// --- TSO: 4 session opens ---
+if showTSO
+    if f_isFirstBarOf(19, 30)
+        f_drawLvl(tsoLines, colTSO, "TSO Asia", maxOpensKept)
+    if f_isFirstBarOf(1, 30)
+        f_drawLvl(tsoLines, colTSO, "TSO London", maxOpensKept)
+    if f_isFirstBarOf(7, 30)
+        f_drawLvl(tsoLines, colTSO, "TSO NY AM", maxOpensKept)
+    if f_isFirstBarOf(13, 30)
+        f_drawLvl(tsoLines, colTSO, "TSO NY PM", maxOpensKept)
+
+// Update right edge of all True Open lines/labels to follow price each bar
+f_updateExtend(array<Lvl> arr) =>
+    if extendOpens and array.size(arr) > 0
+        for j = 0 to array.size(arr) - 1
+            Lvl l = array.get(arr, j)
+            if not na(l.lb)
+                label.set_x(l.lb, bar_index)
+
+f_updateExtend(tdoLines)
+f_updateExtend(twoLines)
+f_updateExtend(tmoLines)
+f_updateExtend(tyoLines)
+f_updateExtend(tsoLines)
+
+// =============================================================================
+// ALERT CONDITIONS
+// =============================================================================
+
+alertcondition(f_isFirstBarOf(0, 0), "True Day Open (00:00 NY)", "TDO @ {{ticker}}")
+alertcondition(isWeekStart,           "True Week Open (Sun 18:00 NY)", "TWO @ {{ticker}}")
+alertcondition(f_isFirstBarOf(18, 0) or f_isFirstBarOf(0, 0) or f_isFirstBarOf(6, 0) or f_isFirstBarOf(12, 0),
+               "Daily Quarter open", "Q-open @ {{ticker}}")
