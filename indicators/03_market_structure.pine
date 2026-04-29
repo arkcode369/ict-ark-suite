@@ -306,6 +306,19 @@ if showCISD and barstate.isconfirmed
             alert("Bearish CISD @ " + str.tostring(close), alert.freq_once_per_bar_close)
 
 // =============================================================================
+// HIDDEN OUTPUT PLOTS FOR DASHBOARD BINDING (Modul 09 input.source)
+// -----------------------------------------------------------------------------
+// These plots are invisible (display=none) but available in any other script
+// via input.source("ICT-MS: ..."). Dashboard reads them.
+// =============================================================================
+
+plot(trendDir,           title = "ICT-MS: trendDir",          display = display.data_window, color = color.new(color.white, 100))
+plot(barstate.isconfirmed and f_isSwingHigh(swingLB) ? 1 : 0,
+     title = "ICT-MS: swingHighFlag",   display = display.data_window, color = color.new(color.white, 100))
+plot(barstate.isconfirmed and f_isSwingLow(swingLB) ? 1 : 0,
+     title = "ICT-MS: swingLowFlag",    display = display.data_window, color = color.new(color.white, 100))
+
+// =============================================================================
 // ALERT CONDITIONS (dropdown UI)
 // =============================================================================
 

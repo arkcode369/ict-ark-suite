@@ -44,6 +44,7 @@ indicator(
 // =============================================================================
 
 G_DASH = "Dashboard"
+G_EXT  = "External Sources (bind to other modul plots)"
 
 dashPos = input.string("top_right",
             "Position",
@@ -53,9 +54,17 @@ dashSize = input.string("normal",
             "Text size",
             options = ["tiny", "small", "normal", "large"],
             group = G_DASH)
-showHTF = input.bool(true, "Show HTF bias rows",          group = G_DASH)
-showSess = input.bool(true, "Show session / time rows",    group = G_DASH)
+showHTF   = input.bool(true, "Show HTF bias rows",         group = G_DASH)
+showSess  = input.bool(true, "Show session / time rows",   group = G_DASH)
 showLevel = input.bool(true, "Show level / context rows",  group = G_DASH)
+showExt   = input.bool(true, "Show External (bind) rows",  group = G_DASH)
+
+// External plot bindings: select plots from other ICT-Suite modules already
+// on the chart. Defaults to `close` (no external link) until user binds them.
+extMSTrend     = input.source(close, "MS trendDir (Modul 03)",     group = G_EXT)
+extLITSweep    = input.source(close, "LIT sweepFlag (Modul 02)",   group = G_EXT)
+extPDFvgBull   = input.source(close, "PD bull-FVG plot (Modul 01)", group = G_EXT)
+extPDFvgBear   = input.source(close, "PD bear-FVG plot (Modul 01)", group = G_EXT)
 
 // =============================================================================
 // HELPERS
@@ -192,7 +201,7 @@ cisdHint = close > cisdMean ? "Bias↑" : close < cisdMean ? "Bias↓" : "—"
 var table dash = na
 
 if na(dash)
-    dash := table.new(f_pos(), columns = 2, rows = 16,
+    dash := table.new(f_pos(), columns = 2, rows = 20,
          bgcolor = color.new(color.black, 70),
          border_width = 1,
          border_color = color.new(color.gray, 60))
@@ -246,4 +255,34 @@ if barstate.islast
         row += 1
         f_setRow(row, "CISD hint",       cisdHint,  cisdHint == "Bias↑" ? color.green :
                                                     cisdHint == "Bias↓" ? color.red : color.gray)
+        row += 1
+
+    if showExt
+        // External MS trend (-1 / 0 / 1) — coerce to label
+        string msTrendTxt = extMSTrend > 0.5 ? "BULL (MSS↑)"
+                            : extMSTrend < -0.5 ? "BEAR (MSS↓)"
+                            : "—"
+        color msTrendCol = extMSTrend > 0.5 ? color.green
+                           : extMSTrend < -0.5 ? color.red
+                           : color.gray
+        f_setRow(row, "MS trend (ext)", msTrendTxt, msTrendCol)
+        row += 1
+
+        string litTxt = extLITSweep > 0.5 ? "BSL swept"
+                        : extLITSweep < -0.5 ? "SSL swept"
+                        : "—"
+        color litCol = extLITSweep > 0.5 ? color.fuchsia
+                       : extLITSweep < -0.5 ? color.fuchsia
+                       : color.gray
+        f_setRow(row, "Liquidity (ext)", litTxt, litCol)
+        row += 1
+
+        bool pdBullActive = extPDFvgBull > 0.5
+        bool pdBearActive = extPDFvgBear > 0.5
+        string pdTxt = pdBullActive and pdBearActive ? "Bull+Bear FVG"
+                       : pdBullActive ? "Bull FVG"
+                       : pdBearActive ? "Bear FVG"
+                       : "—"
+        color pdCol = pdBullActive ? color.green : pdBearActive ? color.red : color.gray
+        f_setRow(row, "PD ext", pdTxt, pdCol)
         row += 1
