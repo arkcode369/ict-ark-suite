@@ -1,0 +1,249 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | Top-Down Dashboard
+// -----------------------------------------------------------------------------
+// File:        indicators/09_dashboard.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concepts:    docs/concepts/concept-foundation-model.md   (Top-down workflow)
+//              docs/concepts/concept-logic.md              (HTF→MTF→LTF stack)
+//              docs/concepts/concept-monsterlab.md         (IOF / PO3 / STDV)
+//              docs/concepts/concept-quarterly-theory.md   (True Opens / Q1-Q4)
+//              docs/concepts/concept-lit.md                (LIT cycle / Inducement)
+//              docs/concepts/concept-crt.md                (Time framework / 1-5-9)
+//
+// Purpose:
+//   This indicator does NOT draw on price. It renders a real-time table
+//   summarising the trader's checklist before pulling the trigger:
+//     • HTF bias (D1 EMA20 / D1 close vs prev-day open)
+//     • MTF bias (H4 EMA20)
+//     • In Killzone? (Asia / London / NY AM / NY PM)
+//     • In Macro? (6 ICT macros)
+//     • Silver Bullet active?
+//     • Quarter (Q1 / Q2 / Q3 / Q4) — daily 6h cycle
+//     • TDO / TWO levels
+//     • Above / Below Devil's Mark (prev-day mid)
+//     • Premium / Discount of prev-day range
+//     • PD context (recent FVG / OB nearby?) — heuristic via ATR
+//     • Liquidity context (recent swept high or low?)
+//     • CISD-state hint (close vs N-bar mean of opens)
+//
+// Repaint policy: NONE. All rows recompute every bar; values shown reflect
+//   current bar's state.
+// =============================================================================
+
+indicator(
+     "ICT/SMC Suite | Dashboard",
+     shorttitle = "ICT-DASH",
+     overlay = false,
+     scale = scale.none
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_DASH = "Dashboard"
+
+dashPos = input.string("top_right",
+            "Position",
+            options = ["top_left", "top_right", "middle_right", "bottom_right", "bottom_left"],
+            group = G_DASH)
+dashSize = input.string("normal",
+            "Text size",
+            options = ["tiny", "small", "normal", "large"],
+            group = G_DASH)
+showHTF = input.bool(true, "Show HTF bias rows",          group = G_DASH)
+showSess = input.bool(true, "Show session / time rows",    group = G_DASH)
+showLevel = input.bool(true, "Show level / context rows",  group = G_DASH)
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+f_pos() =>
+    switch dashPos
+        "top_left"      => position.top_left
+        "top_right"     => position.top_right
+        "middle_right"  => position.middle_right
+        "bottom_right"  => position.bottom_right
+        "bottom_left"   => position.bottom_left
+        =>                 position.top_right
+
+f_sz() =>
+    switch dashSize
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        "large"  => size.large
+        =>          size.normal
+
+f_inSess(string sess) =>
+    not na(time(timeframe.period, sess, "America/New_York"))
+
+// =============================================================================
+// HTF BIAS
+// =============================================================================
+
+ema20 = ta.ema(close, 20)
+dEMA20 = request.security(syminfo.tickerid, "D",
+     ta.ema(close, 20),
+     lookahead = barmerge.lookahead_off)
+h4EMA20 = request.security(syminfo.tickerid, "240",
+     ta.ema(close, 20),
+     lookahead = barmerge.lookahead_off)
+[dHigh, dLow, dOpen, dClose] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1], open[1], close[1]],
+     lookahead = barmerge.lookahead_off)
+
+dailyBias = na(dEMA20) ? "—" : close > dEMA20 ? "BULL" : close < dEMA20 ? "BEAR" : "NEUTRAL"
+htfBias  = na(h4EMA20) ? "—" : close > h4EMA20 ? "BULL" : close < h4EMA20 ? "BEAR" : "NEUTRAL"
+
+// =============================================================================
+// SESSION / TIME
+// =============================================================================
+
+inAsia   = f_inSess("2000-2400:23456")
+inLondon = f_inSess("0200-0500:23456")
+inNYAM   = f_inSess("0700-1000:23456")
+inNYPM   = f_inSess("1330-1600:23456")
+inSBL    = f_inSess("0300-0400:23456")
+inSBA    = f_inSess("1000-1100:23456")
+inSBP    = f_inSess("1400-1500:23456")
+inMacro1 = f_inSess("0950-1010:23456")
+inMacro2 = f_inSess("1050-1110:23456")
+inMacro3 = f_inSess("1150-1210:23456")
+inMacro4 = f_inSess("1310-1340:23456")
+inMacro5 = f_inSess("1450-1510:23456")
+inMacro6 = f_inSess("1515-1545:23456")
+
+killzone = inAsia ? "Asia" : inLondon ? "London" : inNYAM ? "NY AM" : inNYPM ? "NY PM" : "—"
+silverBullet = inSBL ? "London" : inSBA ? "NY AM" : inSBP ? "NY PM" : "—"
+inMacro = inMacro1 or inMacro2 or inMacro3 or inMacro4 or inMacro5 or inMacro6
+macroTag = inMacro1 ? "M1 09:50" : inMacro2 ? "M2 10:50" : inMacro3 ? "M3 11:50"
+           : inMacro4 ? "M4 13:10" : inMacro5 ? "M5 14:50" : inMacro6 ? "M6 15:15" : "—"
+
+// Daily quarter (6h cycle, NY tz)
+H = hour(time, "America/New_York")
+quarterTag = H >= 18 or H < 0 ? "Q1 (18-00 Acc)"
+             : H < 6 ? "Q2 (00-06 Manip / Asia)"
+             : H < 12 ? "Q3 (06-12 Distr / LDN+NYAM)"
+             : "Q4 (12-18 Rev/Cont)"
+
+// =============================================================================
+// LEVELS / CONTEXT
+// =============================================================================
+
+prevDayMid = na(dHigh) or na(dLow) ? na : math.avg(dHigh, dLow)
+sideOfDevil = na(prevDayMid) ? "—"
+              : close > prevDayMid ? "ABOVE (premium of D)"
+              : close < prevDayMid ? "BELOW (discount of D)"
+              : "AT mid"
+
+prevDayRangeMid = prevDayMid
+prevDayQ1 = na(dHigh) or na(dLow) ? na : dLow + (dHigh - dLow) * 0.25
+prevDayQ3 = na(dHigh) or na(dLow) ? na : dLow + (dHigh - dLow) * 0.75
+pdContext = na(prevDayRangeMid) ? "—"
+            : close >= prevDayQ3 ? "DEEP PREMIUM"
+            : close >= prevDayMid ? "Premium"
+            : close > prevDayQ1 ? "Discount"
+            : "DEEP DISCOUNT"
+
+// PD heuristic: any FVG within last 20 bars within 1 ATR of close?
+fvgBullNear = false
+fvgBearNear = false
+atrV = ta.atr(14)
+for i = 0 to math.min(20, bar_index)
+    if low[i] > high[i + 2]   // bullish FVG signature
+        if math.abs(close - high[i + 2]) < atrV
+            fvgBullNear := true
+            break
+for i = 0 to math.min(20, bar_index)
+    if high[i] < low[i + 2]   // bearish FVG
+        if math.abs(close - low[i + 2]) < atrV
+            fvgBearNear := true
+            break
+fvgTag = fvgBullNear and fvgBearNear ? "Bull+Bear FVG"
+         : fvgBullNear ? "Bull FVG nearby"
+         : fvgBearNear ? "Bear FVG nearby"
+         : "—"
+
+// Liquidity context: in last 30 bars, did price wick beyond a swing & close back?
+liqRecent = false
+liqSide = "—"
+for i = 1 to math.min(30, bar_index - 5)
+    if high[i] > ta.highest(high, 10)[i + 1] and close[i] < ta.highest(high, 10)[i + 1]
+        liqRecent := true
+        liqSide := "BSL swept"
+        break
+    if low[i] < ta.lowest(low, 10)[i + 1] and close[i] > ta.lowest(low, 10)[i + 1]
+        liqRecent := true
+        liqSide := "SSL swept"
+        break
+
+// CISD hint
+float cisdMean = ta.sma(open, 10)
+cisdHint = close > cisdMean ? "Bias↑" : close < cisdMean ? "Bias↓" : "—"
+
+// =============================================================================
+// TABLE
+// =============================================================================
+
+var table dash = na
+
+if na(dash)
+    dash := table.new(f_pos(), columns = 2, rows = 16,
+         bgcolor = color.new(color.black, 70),
+         border_width = 1,
+         border_color = color.new(color.gray, 60))
+
+f_setRow(int r, string k, string v, color cv) =>
+    table.cell(dash, 0, r, k, text_color = color.silver, text_size = f_sz(),
+               bgcolor = color.new(color.black, 50))
+    table.cell(dash, 1, r, v, text_color = color.white,  text_size = f_sz(),
+               bgcolor = color.new(cv, 70))
+
+f_biasColor(string b) =>
+    b == "BULL" ? color.green : b == "BEAR" ? color.red : color.gray
+
+if barstate.islast
+    int row = 0
+    table.cell(dash, 0, row, "ICT/SMC Suite", text_color = color.yellow,
+               text_size = f_sz(), bgcolor = color.new(color.gray, 50))
+    table.cell(dash, 1, row, "Dashboard",     text_color = color.yellow,
+               text_size = f_sz(), bgcolor = color.new(color.gray, 50))
+    row += 1
+
+    if showHTF
+        f_setRow(row, "Daily bias",    dailyBias, f_biasColor(dailyBias))
+        row += 1
+        f_setRow(row, "H4 bias",       htfBias,   f_biasColor(htfBias))
+        row += 1
+
+    if showSess
+        f_setRow(row, "Killzone",      killzone, killzone == "—" ? color.gray : color.aqua)
+        row += 1
+        f_setRow(row, "Silver Bullet", silverBullet, silverBullet == "—" ? color.gray : color.silver)
+        row += 1
+        f_setRow(row, "Macro",         macroTag, inMacro ? color.red : color.gray)
+        row += 1
+        f_setRow(row, "Daily Quarter", quarterTag, color.aqua)
+        row += 1
+
+    if showLevel
+        f_setRow(row, "Devil's Mark",   sideOfDevil,
+                 sideOfDevil == "—" ? color.gray :
+                 str.contains(sideOfDevil, "ABOVE") ? color.green : color.red)
+        row += 1
+        f_setRow(row, "Premium/Discount", pdContext,
+                 pdContext == "—" ? color.gray :
+                 str.contains(pdContext, "PREMIUM") ? color.maroon :
+                 str.contains(pdContext, "DISCOUNT") ? color.green : color.gray)
+        row += 1
+        f_setRow(row, "FVG nearby",      fvgTag,    fvgTag == "—" ? color.gray : color.aqua)
+        row += 1
+        f_setRow(row, "Liquidity (30b)", liqSide,   liqRecent ? color.fuchsia : color.gray)
+        row += 1
+        f_setRow(row, "CISD hint",       cisdHint,  cisdHint == "Bias↑" ? color.green :
+                                                    cisdHint == "Bias↓" ? color.red : color.gray)
+        row += 1
