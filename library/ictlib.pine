@@ -1,0 +1,329 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite — Shared Library
+// -----------------------------------------------------------------------------
+// File:        library/ictlib.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concepts:    docs/concepts/{concept-logic, concept-quarterly-theory,
+//              concept-monsterlab, concept-foundation-model, concept-crt,
+//              concept-turtle-soup}.md
+// Description: Helper functions reused across the ICT/SMC Suite indicators —
+//              swing detection, FVG/OB detection, true opens, killzones,
+//              standard deviations, premium/discount.
+//
+// USAGE:
+//   1. In TradingView Pine Editor: Save as Library → publish.
+//   2. In an indicator: import arkcode369/ictlib/1 as ict
+//   3. Until the library is published, indicators in this repo inline these
+//      helpers (see indicators/*.pine). After publishing, those scripts will
+//      be refactored to use `import`.
+//
+// Repaint disclosures (per function) are documented inline.
+// =============================================================================
+// @description Shared helpers for ICT/SMC Suite indicators.
+library("ictlib", overlay = true)
+
+// =============================================================================
+// SECTION: TYPE DEFINITIONS
+// =============================================================================
+
+// @type     Generic price zone (FVG, OB, Breaker, Mitigation, BPR, etc.).
+// @field    top         Top price of the zone.
+// @field    bot         Bottom price of the zone.
+// @field    left        Bar index where the zone starts.
+// @field    right       Bar index where the zone ends (na = extended right).
+// @field    bullish     True for bullish/buy-side zone.
+// @field    mitigated   True if price has tagged the zone but not invalidated it.
+// @field    invalidated True if price has closed through and removed the zone.
+// @field    kind        Zone kind tag: "FVG", "OB", "BREAKER", "MIT", "BPR", "VI", "RB", "VAC".
+export type Zone
+    float top
+    float bot
+    int   left
+    int   right = na
+    bool  bullish
+    bool  mitigated   = false
+    bool  invalidated = false
+    string kind       = "FVG"
+
+// @type     Liquidity reference point (BSL/SSL, equal H/L, prev H/L).
+// @field    price       Liquidity price level.
+// @field    bar         Bar index where the level was established.
+// @field    buyside     True for BSL (above price), false for SSL (below price).
+// @field    swept       True once price has wicked through and closed back.
+export type Liquidity
+    float price
+    int   bar
+    bool  buyside
+    bool  swept = false
+
+// =============================================================================
+// SECTION: SWING / FRACTAL
+// -----------------------------------------------------------------------------
+// Repaint policy: TRUE swing detection is post-hoc. The candidate sits at
+// offset = lookback bars back, and is only confirmed once `lookback` more bars
+// have closed without breaking it. Caller bars on the chart will not change
+// after the confirmation bar.
+// =============================================================================
+
+// @function    True if the bar at offset `lookback` is a confirmed swing high.
+// @param       lookback Number of bars on each side of the candidate.
+// @returns     bool
+export isSwingHigh(simple int lookback = 3) =>
+    bool result = true
+    float candidate = high[lookback]
+    for i = 0 to lookback * 2
+        if i != lookback and high[i] > candidate
+            result := false
+            break
+    result
+
+// @function    True if the bar at offset `lookback` is a confirmed swing low.
+export isSwingLow(simple int lookback = 3) =>
+    bool result = true
+    float candidate = low[lookback]
+    for i = 0 to lookback * 2
+        if i != lookback and low[i] < candidate
+            result := false
+            break
+    result
+
+// =============================================================================
+// SECTION: FAIR VALUE GAP (FVG)
+// -----------------------------------------------------------------------------
+// Bullish FVG: low[0] > high[2]  (3-candle gap, candle [1] is the impulse).
+// Bearish FVG: high[0] < low[2].
+// Repaint policy: NONE. Detected at bar close; gap geometry is fixed.
+// =============================================================================
+
+// @function    Detect a bullish FVG on the current bar.
+// @param       threshold ATR(14) multiplier filter; 0 = no filter.
+// @returns     [detected, top, bot]
+export detectBullFVG(simple float threshold = 0.0) =>
+    bool detected = low > high[2]
+    float top = low
+    float bot = high[2]
+    if detected and threshold > 0.0
+        if (top - bot) < threshold * ta.atr(14)
+            detected := false
+    [detected, top, bot]
+
+// @function    Detect a bearish FVG on the current bar.
+export detectBearFVG(simple float threshold = 0.0) =>
+    bool detected = high < low[2]
+    float top = low[2]
+    float bot = high
+    if detected and threshold > 0.0
+        if (top - bot) < threshold * ta.atr(14)
+            detected := false
+    [detected, top, bot]
+
+// @function    Consequent Encroachment (50% midpoint) of a zone.
+export ce(float top, float bot) => math.avg(top, bot)
+
+// =============================================================================
+// SECTION: ORDER BLOCK (OB)
+// -----------------------------------------------------------------------------
+// Bullish OB: last opposing (bearish) candle before a displacement up.
+// Bearish OB: last opposing (bullish) candle before a displacement down.
+// Repaint policy: WHILE displacement is forming. Once confirmed (bar after
+// the displacement closes), the OB anchor is fixed.
+// =============================================================================
+
+// @function    Detect a bullish OB on the current bar.
+// @param       displacement Minimum impulse body in ATR(14) multiples.
+// @returns     [detected, top, bot, leftBarIdx]
+export detectBullOB(simple float displacement = 1.0) =>
+    bool detected = false
+    float top = na
+    float bot = na
+    int leftBar = na
+    bool isImpulseUp = close > open
+    float body = math.abs(close - open)
+    float minBody = displacement * ta.atr(14)
+    if isImpulseUp and body >= minBody
+        for i = 1 to 5
+            if close[i] < open[i]
+                top := high[i]
+                bot := low[i]
+                leftBar := bar_index - i
+                detected := true
+                break
+    [detected, top, bot, leftBar]
+
+// @function    Detect a bearish OB on the current bar.
+export detectBearOB(simple float displacement = 1.0) =>
+    bool detected = false
+    float top = na
+    float bot = na
+    int leftBar = na
+    bool isImpulseDown = close < open
+    float body = math.abs(close - open)
+    float minBody = displacement * ta.atr(14)
+    if isImpulseDown and body >= minBody
+        for i = 1 to 5
+            if close[i] > open[i]
+                top := high[i]
+                bot := low[i]
+                leftBar := bar_index - i
+                detected := true
+                break
+    [detected, top, bot, leftBar]
+
+// =============================================================================
+// SECTION: ZONE MITIGATION / INVALIDATION
+// -----------------------------------------------------------------------------
+// Repaint policy: NONE. Mitigation flagged the moment price tags the zone.
+// =============================================================================
+
+// @function    Returns mitigation/invalidation status for a zone vs current bar.
+// @returns     [mitigated, invalidated]
+export checkZone(Zone z) =>
+    bool m = z.mitigated
+    bool inv = z.invalidated
+    if not inv
+        if z.bullish
+            if low <= z.top
+                m := true
+            if close < z.bot
+                inv := true
+        else
+            if high >= z.bot
+                m := true
+            if close > z.top
+                inv := true
+    [m, inv]
+
+// =============================================================================
+// SECTION: PREMIUM / DISCOUNT
+// =============================================================================
+
+export equilibrium(float h, float l) => math.avg(h, l)
+export inPremium(float price, float h, float l) => price > equilibrium(h, l)
+export inDiscount(float price, float h, float l) => price < equilibrium(h, l)
+
+// =============================================================================
+// SECTION: STANDARD DEVIATIONS
+// -----------------------------------------------------------------------------
+// CRT/MMXM/MonsterLab/Foundation all project ranges in standard deviations.
+// We treat the range = high - low, equilibrium = midpoint. Each STDV step
+// equals the full range above/below equilibrium.
+//   level = +1   →  equilibrium + range/2 * 1 = the original range high
+//   level = +2   →  equilibrium + range/2 * 2 (one full range above eq)
+//   level = -1   →  the original range low
+// =============================================================================
+
+// @function    Compute price level at a given STDV level above/below an anchored range.
+export stdvLevel(float h, float l, float level) =>
+    float rng = h - l
+    float eq = math.avg(h, l)
+    eq + rng * level / 2.0
+
+// =============================================================================
+// SECTION: SESSIONS / KILLZONES (ICT)
+// -----------------------------------------------------------------------------
+// All times below are NY timezone (America/New_York).
+// Pine session day codes: 1=Sun, 2=Mon, 3=Tue, 4=Wed, 5=Thu, 6=Fri, 7=Sat.
+// "23456" = Mon-Fri.
+// =============================================================================
+
+// @function    True if current bar within Asia killzone (20:00 - 00:00 NY).
+export inAsia() =>
+    not na(time(timeframe.period, "2000-2400:23456", "America/New_York"))
+
+// @function    True if current bar within London killzone (02:00 - 05:00 NY).
+export inLondon() =>
+    not na(time(timeframe.period, "0200-0500:23456", "America/New_York"))
+
+// @function    True if current bar within NY AM killzone (07:00 - 10:00 NY).
+export inNYAM() =>
+    not na(time(timeframe.period, "0700-1000:23456", "America/New_York"))
+
+// @function    True if current bar within NY PM killzone (13:30 - 16:00 NY).
+export inNYPM() =>
+    not na(time(timeframe.period, "1330-1600:23456", "America/New_York"))
+
+// @function    True if current bar within an ICT Macro window.
+//   macroId: 0=09:50-10:10, 1=10:50-11:10, 2=11:50-12:10, 3=13:10-13:40,
+//            4=14:50-15:10, 5=15:15-15:45 NY.
+export inMacro(simple int macroId) =>
+    string sess = switch macroId
+        0 => "0950-1010:23456"
+        1 => "1050-1110:23456"
+        2 => "1150-1210:23456"
+        3 => "1310-1340:23456"
+        4 => "1450-1510:23456"
+        5 => "1515-1545:23456"
+        => "0000-0000:23456"
+    not na(time(timeframe.period, sess, "America/New_York"))
+
+// @function    True if current bar within Silver Bullet hour.
+//   sessionId: 0=London 03:00-04:00, 1=NY AM 10:00-11:00, 2=NY PM 14:00-15:00 NY.
+export inSilverBullet(simple int sessionId) =>
+    string sess = switch sessionId
+        0 => "0300-0400:23456"
+        1 => "1000-1100:23456"
+        2 => "1400-1500:23456"
+        => "0000-0000:23456"
+    not na(time(timeframe.period, sess, "America/New_York"))
+
+// =============================================================================
+// SECTION: TRUE OPENS (Quarterly Theory)
+// -----------------------------------------------------------------------------
+// True Day Open      = 00:00 NY (midnight)
+// True Session Open  = Asia 19:30, London 01:30, NY AM 07:30, NY PM 13:30
+// True Week Open     = Tuesday open / Monday 18:00 NY
+// True Month Open    = 2nd full week's Monday open
+// True Year Open     = first Monday of April
+//
+// Repaint policy: NONE. Each open is captured the first time the relevant
+// session boundary is crossed and held thereafter.
+// =============================================================================
+
+// @function    True Day Open (00:00 NY price for the current trading day).
+export trueDayOpen() =>
+    var float val = na
+    int h = hour(time, "America/New_York")
+    int m = minute(time, "America/New_York")
+    bool atMidnight = h == 0 and m == 0
+    if atMidnight
+        val := open
+    val
+
+// @function    True Session Open price.
+//   sessionId: 0=Asia 19:30, 1=London 01:30, 2=NY AM 07:30, 3=NY PM 13:30 NY.
+export trueSessionOpen(simple int sessionId) =>
+    var float val = na
+    int h = hour(time, "America/New_York")
+    int m = minute(time, "America/New_York")
+    bool match = switch sessionId
+        0 => h == 19 and m == 30
+        1 => h == 1  and m == 30
+        2 => h == 7  and m == 30
+        3 => h == 13 and m == 30
+        => false
+    if match
+        val := open
+    val
+
+// =============================================================================
+// SECTION: LIQUIDITY
+// =============================================================================
+
+// @function    True if current bar swept (wicked through and closed back below) a level.
+export sweptHigh(float lvl) => high > lvl and close < lvl
+
+// @function    True if current bar swept a level on the buy side (low wick down, close back up).
+export sweptLow(float lvl) => low < lvl and close > lvl
+
+// =============================================================================
+// SECTION: ATR / RANGE HELPERS
+// =============================================================================
+
+export atr14() => ta.atr(14)
+export atrN(simple int len) => ta.atr(len)
+
+// =============================================================================
+// END OF LIBRARY
+// =============================================================================
