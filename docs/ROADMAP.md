@@ -50,15 +50,21 @@
 - [x] `strategies/08_stdv_mean_reversion_strategy.pine` — Devil's Mark mean-reversion
 - [x] `strategies/combo_strategy.pine` — multi-confluence (PD + LIT + MSS + KZ + P/D)
 
-### v0.4+ — Future iterations
-- [ ] Alert templates per setup model (preset alert presets, JSON webhook templates)
-- [ ] Multi-symbol portfolio backtest harness
-- [ ] Walk-forward / Monte Carlo helper (script-based)
-- [ ] Trade journal export (CSV via labels)
-- [ ] CRT model #1 entry detector + dedicated strategy
-- [ ] PO3 AMD model strategy variant
-- [ ] Liquidity-vacuum / void detector
-- [ ] OTE (Optimal Trade Entry) zone confluence overlay
+### v0.4 — Models, OTE, Voids & Docs (RILIS)
+- [x] CRT Model #1 entry detector + dedicated strategy — `strategies/06_crt_model1_strategy.pine`
+- [x] PO3 AMD model strategy variant — `strategies/06_po3_strategy.pine`
+- [x] OTE (Optimal Trade Entry) zone confluence overlay — `indicators/11_ote.pine`
+- [x] Liquidity-vacuum / void detector — `indicators/12_liquidity_void.pine`
+- [x] Alert webhook JSON templates — `docs/alerts/README.md`
+- [x] Walk-forward / Monte Carlo guide — `docs/WALK_FORWARD.md`
+
+### v0.5+ — Future iterations
+- [ ] Multi-symbol portfolio backtest harness (Python wrapper)
+- [ ] Trade journal CSV export (script-based, via labels)
+- [ ] Auto-trade integration helper (PineConnector / TradingConnector recipes)
+- [ ] Order Flow / volume-profile overlay (if TradingView Premium volume data available)
+- [ ] Composite "ICT Score" oscillator (sub-pane)
+- [ ] Telegram bot scaffolding (Python service that consumes webhooks → human-readable digest)
 
 ## Catatan Implementasi
 
