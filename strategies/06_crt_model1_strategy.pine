@@ -1,0 +1,184 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | CRT Model #1 Strategy
+// -----------------------------------------------------------------------------
+// File:        strategies/06_crt_model1_strategy.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concept:     docs/concepts/concept-crt.md (Model #1 — bias HTF, manipulation
+//              di session pertama, distribution di session berikutnya)
+//              docs/concepts/concept-monsterlab.md
+//
+// Setup:
+//   1) HTF (D1) bias: D-1 close > D-1 mid → bullish HTF; sebaliknya bearish.
+//   2) Manipulation phase: di session pertama (Asia atau London open),
+//      sweep liquidity opposite bias (sweep PDH untuk bear, PDL untuk bull).
+//   3) Reclaim: harga close back di sisi bias (closing candle conf).
+//   4) Entry: di session berikutnya (London/NY) saat retracement masuk OTE
+//      ATAU FVG dari leg manipulation→displacement.
+//
+// Simplified versi backtest:
+//   - Bias: close[1] > avg(high[1], low[1]) on D1 = bullish, sebaliknya = bearish.
+//   - Manipulation: detect sweep PDH/PDL di session 1 (default Asia 18:00–03:00 NY).
+//   - Entry: di session 2 (default London 02:00–05:00 NY) saat fade-and-reclaim
+//     dengan OTE retracement.
+//   - SL: di sweep extreme ± slBuf × ATR.
+//   - TP: PDH (bull) atau PDL (bear) sebagai DOL.
+// =============================================================================
+
+strategy(
+     "ICT/SMC Suite | CRT Model #1 Strategy",
+     shorttitle = "ICT-CRT-M1",
+     overlay = true,
+     pyramiding = 0,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 1,
+     initial_capital = 10000,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.04
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_BIAS = "HTF Bias"
+G_SESS = "Sessions"
+G_OTE  = "OTE Entry"
+G_RISK = "Risk"
+G_TIME = "Date Range"
+
+biasMode = input.string("D1_mid", "HTF bias mode",
+                        options = ["D1_mid", "D1_close_gt_open"], group = G_BIAS)
+
+manipSess  = input.session("1800-0300", "Manipulation session (NY tz)", group = G_SESS)
+entrySess  = input.session("0200-0500", "Entry session (NY tz)",        group = G_SESS)
+
+oteFibLow  = input.float(0.62, "OTE fib low",  step = 0.005, group = G_OTE)
+oteFibHigh = input.float(0.79, "OTE fib high", step = 0.005, group = G_OTE)
+
+slBuf  = input.float(0.2, "SL buffer (× ATR14)",  step = 0.05, group = G_RISK)
+tpDOL  = input.bool(true, "TP at PDH/PDL (DOL)",  group = G_RISK)
+tpRR   = input.float(2.0, "Fallback TP (× risk) when DOL invalid", step = 0.1, group = G_RISK)
+
+startDate = input.time(timestamp("01 Jan 2020 00:00"), "Backtest start", group = G_TIME)
+endDate   = input.time(timestamp("31 Dec 2099 00:00"), "Backtest end",   group = G_TIME)
+inDate    = time >= startDate and time <= endDate
+
+// =============================================================================
+// HTF BIAS
+// =============================================================================
+
+[d1H, d1L, d1O, d1C] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1], open[1], close[1]],
+     lookahead = barmerge.lookahead_off)
+
+biasUp = biasMode == "D1_mid" ?
+     d1C > math.avg(d1H, d1L) : d1C > d1O
+biasDown = not biasUp
+
+pdh = d1H
+pdl = d1L
+
+// =============================================================================
+// SESSION DETECTION
+// =============================================================================
+
+inManip = not na(time(timeframe.period, manipSess + ":1234567", "America/New_York"))
+inEntry = not na(time(timeframe.period, entrySess + ":1234567", "America/New_York"))
+
+// =============================================================================
+// MANIPULATION (SWEEP) DETECTION
+// =============================================================================
+
+var bool manipDoneBull = false  // sweep PDL terjadi (untuk bull bias)
+var bool manipDoneBear = false  // sweep PDH terjadi (untuk bear bias)
+var float swExtreme = na
+
+// Reset di awal session manipulasi (transisi tidak inManip → inManip)
+manipStart = inManip and not inManip[1]
+if manipStart
+    manipDoneBull := false
+    manipDoneBear := false
+    swExtreme := na
+
+if barstate.isconfirmed and inManip
+    if biasUp and low < pdl
+        manipDoneBull := true
+        swExtreme := math.min(nz(swExtreme, low), low)
+    if biasDown and high > pdh
+        manipDoneBear := true
+        swExtreme := math.max(nz(swExtreme, high), high)
+
+// =============================================================================
+// LEG TRACKING for OTE (manipulation → displacement)
+// =============================================================================
+
+var float legBot = na
+var float legTop = na
+
+if barstate.isconfirmed
+    if manipDoneBull
+        legBot := nz(swExtreme, low)
+        legTop := math.max(nz(legTop, high), high)
+    if manipDoneBear
+        legTop := nz(swExtreme, high)
+        legBot := math.min(nz(legBot, low), low)
+
+// =============================================================================
+// OTE ENTRY
+// =============================================================================
+
+float oteHi = na
+float oteLo = na
+if not na(legTop) and not na(legBot) and legTop > legBot
+    if biasUp
+        oteHi := legTop - oteFibLow  * (legTop - legBot)
+        oteLo := legTop - oteFibHigh * (legTop - legBot)
+    else
+        oteHi := legBot + oteFibHigh * (legTop - legBot)
+        oteLo := legBot + oteFibLow  * (legTop - legBot)
+
+atrV = ta.atr(14)
+
+bool inOTE = not na(oteHi) and not na(oteLo) and low <= oteHi and high >= oteLo
+
+longCond  = barstate.isconfirmed and biasUp   and inEntry and manipDoneBull and inOTE and inDate
+shortCond = barstate.isconfirmed and biasDown and inEntry and manipDoneBear and inOTE and inDate
+
+// =============================================================================
+// ENTRIES
+// =============================================================================
+
+if longCond and strategy.position_size <= 0
+    float sl = legBot - slBuf * atrV
+    float ent = close
+    float risk = ent - sl
+    if risk > 0
+        float tp = tpDOL ? pdh : ent + tpRR * risk
+        if tp <= ent
+            tp := ent + tpRR * risk
+        strategy.entry("L-CRT1", strategy.long)
+        strategy.exit("X", from_entry = "L-CRT1", stop = sl, limit = tp)
+
+if shortCond and strategy.position_size >= 0
+    float sl = legTop + slBuf * atrV
+    float ent = close
+    float risk = sl - ent
+    if risk > 0
+        float tp = tpDOL ? pdl : ent - tpRR * risk
+        if tp >= ent
+            tp := ent - tpRR * risk
+        strategy.entry("S-CRT1", strategy.short)
+        strategy.exit("X", from_entry = "S-CRT1", stop = sl, limit = tp)
+
+// =============================================================================
+// VISUAL
+// =============================================================================
+
+plot(pdh, title = "PDH", color = color.new(color.red,  60), style = plot.style_circles)
+plot(pdl, title = "PDL", color = color.new(color.lime, 60), style = plot.style_circles)
+plot(oteHi, title = "OTE high", color = color.new(color.aqua, 70))
+plot(oteLo, title = "OTE low",  color = color.new(color.aqua, 70))
+bgcolor(inManip ? color.new(color.gray, 92) : na, title = "Manip session bg")
+bgcolor(inEntry ? color.new(color.aqua, 92) : na, title = "Entry session bg")

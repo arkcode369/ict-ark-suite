@@ -1,0 +1,169 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | PO3 (AMD) Strategy
+// -----------------------------------------------------------------------------
+// File:        strategies/06_po3_strategy.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concept:     docs/concepts/concept-crt.md (Power of 3: Accumulation /
+//              Manipulation / Distribution)
+//              docs/concepts/concept-ipda-mmxm.md
+//
+// Setup (daily PO3):
+//   - Accumulation: pre-NY session (e.g. Asian range).
+//   - Manipulation: NY open sweep extreme dari accumulation range.
+//   - Distribution: directional move setelah sweep, anchored di NY-open price.
+//
+//   Entry: di awal NY (default 09:30 NY), arah lawan dari sweep manipulation.
+//   - Bullish PO3 entry: low session pre-NY broken (sweep), price reclaim →
+//     long di NY open (atau pada konfirmasi reclaim candle).
+//   - Bearish PO3 entry: mirror.
+//
+//   SL: sweep extreme - ATR buffer.
+//   TP: opposite extreme of accumulation range × tpMult.
+// =============================================================================
+
+strategy(
+     "ICT/SMC Suite | PO3 Strategy",
+     shorttitle = "ICT-PO3",
+     overlay = true,
+     pyramiding = 0,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 1,
+     initial_capital = 10000,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.04
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_RNG  = "Accumulation Range"
+G_NY   = "NY Open / Manipulation"
+G_RISK = "Risk"
+G_TIME = "Date Range"
+
+accSess = input.session("1800-0700", "Accumulation session (NY tz, e.g. Asia+Pre-NY)",
+                        group = G_RNG)
+useATRMin   = input.bool(false, "Skip when accumulation range too small (< minRangeATR × ATR)",
+                         group = G_RNG)
+minRangeATR = input.float(0.5, "Min range size (× ATR14)",
+                          minval = 0.0, step = 0.1, group = G_RNG)
+
+nyOpenHr  = input.int(9,  "NY open hour (NY tz)",   minval = 0, maxval = 23, group = G_NY)
+nyOpenMin = input.int(30, "NY open minute (NY tz)", minval = 0, maxval = 59, group = G_NY)
+manipWindowMin = input.int(60,
+                           "Manipulation window (minutes after NY open)",
+                           minval = 5, maxval = 240, group = G_NY)
+
+slBuf  = input.float(0.3, "SL buffer (× ATR14)",        step = 0.05, group = G_RISK)
+tpMult = input.float(1.0, "TP × accumulation range",     step = 0.1,  group = G_RISK)
+
+startDate = input.time(timestamp("01 Jan 2020 00:00"), "Backtest start", group = G_TIME)
+endDate   = input.time(timestamp("31 Dec 2099 00:00"), "Backtest end",   group = G_TIME)
+inDate    = time >= startDate and time <= endDate
+
+// =============================================================================
+// SESSION + ACCUMULATION TRACKING
+// =============================================================================
+
+inAcc = not na(time(timeframe.period, accSess + ":1234567", "America/New_York"))
+
+var float accHi = na
+var float accLo = na
+var float fixedHi = na
+var float fixedLo = na
+
+// Reset on accumulation session start
+if inAcc and not inAcc[1]
+    accHi := high
+    accLo := low
+
+if inAcc
+    accHi := math.max(nz(accHi, high), high)
+    accLo := math.min(nz(accLo, low), low)
+
+// On accumulation session end, latch
+if not inAcc and inAcc[1]
+    fixedHi := accHi
+    fixedLo := accLo
+
+// =============================================================================
+// NY OPEN / MANIPULATION WINDOW
+// =============================================================================
+
+nyTz       = "America/New_York"
+hourNY     = hour(time, nyTz)
+minuteNY   = minute(time, nyTz)
+nowMinutes = hourNY * 60 + minuteNY
+openMinutes = nyOpenHr * 60 + nyOpenMin
+
+inManip = nowMinutes >= openMinutes and nowMinutes < openMinutes + manipWindowMin
+
+// =============================================================================
+// MANIPULATION DETECTION
+// =============================================================================
+
+var bool manipDoneUp = false  // sweep accLo, expected long
+var bool manipDoneDn = false  // sweep accHi, expected short
+var float manipExtreme = na
+
+// Reset di awal NY day (transisi inManip false → true)
+if inManip and not inManip[1]
+    manipDoneUp := false
+    manipDoneDn := false
+    manipExtreme := na
+
+if barstate.isconfirmed and inManip and not na(fixedLo) and not na(fixedHi)
+    if low < fixedLo and not manipDoneDn
+        manipDoneUp := true
+        manipExtreme := math.min(nz(manipExtreme, low), low)
+    if high > fixedHi and not manipDoneUp
+        manipDoneDn := true
+        manipExtreme := math.max(nz(manipExtreme, high), high)
+
+// =============================================================================
+// REQUIREMENTS
+// =============================================================================
+
+atrV = ta.atr(14)
+
+bool rangeOK = useATRMin ?
+     not na(fixedHi) and not na(fixedLo) and (fixedHi - fixedLo) >= minRangeATR * atrV : true
+
+// =============================================================================
+// ENTRIES
+// =============================================================================
+
+bool longCond  = barstate.isconfirmed and inManip and manipDoneUp and
+                 close > fixedLo and rangeOK and inDate
+bool shortCond = barstate.isconfirmed and inManip and manipDoneDn and
+                 close < fixedHi and rangeOK and inDate
+
+if longCond and strategy.position_size <= 0
+    float sl  = manipExtreme - slBuf * atrV
+    float ent = close
+    float risk = ent - sl
+    if risk > 0
+        float tp = ent + tpMult * (fixedHi - fixedLo)
+        strategy.entry("L-PO3", strategy.long)
+        strategy.exit("X", from_entry = "L-PO3", stop = sl, limit = tp)
+
+if shortCond and strategy.position_size >= 0
+    float sl  = manipExtreme + slBuf * atrV
+    float ent = close
+    float risk = sl - ent
+    if risk > 0
+        float tp = ent - tpMult * (fixedHi - fixedLo)
+        strategy.entry("S-PO3", strategy.short)
+        strategy.exit("X", from_entry = "S-PO3", stop = sl, limit = tp)
+
+// =============================================================================
+// VISUAL
+// =============================================================================
+
+plot(fixedHi, title = "Acc High", color = color.new(color.red,  60), style = plot.style_linebr)
+plot(fixedLo, title = "Acc Low",  color = color.new(color.lime, 60), style = plot.style_linebr)
+bgcolor(inAcc   ? color.new(color.gray, 92) : na, title = "Acc session bg")
+bgcolor(inManip ? color.new(color.aqua, 92) : na, title = "NY manip window bg")
