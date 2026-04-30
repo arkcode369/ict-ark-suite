@@ -1,0 +1,266 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | Modul 11 — OTE (Optimal Trade Entry)
+// -----------------------------------------------------------------------------
+// File:        indicators/11_ote.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concept:     ICT Optimal Trade Entry — entry zone retracement Fib 62 % – 79 %
+//              dari leg impulse paling baru. Sweet spot 70.5 %.
+//
+// Pendekatan:
+//   - Track leg impulse via 2 swing extremes (high/low) terbaru.
+//   - Bullish leg: swingLow → swingHigh; OTE zone = price antara fib 0.62-0.79
+//     dari swing high (atas) ke swing low (bawah). Sweet spot 0.705.
+//   - Setiap leg baru → fade box lama, gambar OTE box baru.
+//   - Tag bila harga touch sweet spot atau exit OTE zone.
+//
+// Repaint policy:
+//   - Swing detection pakai 3-bar fractal half-width (`swingLB`) → 1-bar lag confirmed.
+//   - OTE box baru drawn saat leg flip confirmed; tidak repaint setelah flip.
+//
+// Limits: max 30 OTE boxes (FIFO), 1 active leg per side.
+// =============================================================================
+
+indicator(
+     "ICT/SMC Suite | OTE",
+     shorttitle = "ICT-OTE",
+     overlay = true,
+     max_boxes_count = 100,
+     max_lines_count = 100,
+     max_labels_count = 200
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_LEG  = "Leg / Swings"
+G_FIB  = "Fib Levels"
+G_DSP  = "Display"
+G_ALR  = "Alerts"
+
+swingLB = input.int(5, "Swing fractal half-width",
+                   minval = 2, maxval = 30, group = G_LEG)
+useImpulseFilter = input.bool(true,
+                              "Filter weak legs (require leg ≥ minLegATR × ATR)",
+                              group = G_LEG)
+minLegATR        = input.float(1.5, "Min leg size (× ATR14)",
+                               minval = 0.0, step = 0.1, group = G_LEG)
+maxLegs          = input.int(30, "Max OTE boxes (FIFO)",
+                             minval = 5, maxval = 100, group = G_LEG)
+
+fibLow  = input.float(0.62,   "OTE bottom fib", minval = 0.5, maxval = 0.8, step = 0.005, group = G_FIB)
+fibHigh = input.float(0.79,   "OTE top fib",    minval = 0.6, maxval = 0.9, step = 0.005, group = G_FIB)
+fibSweet = input.float(0.705, "Sweet spot fib", minval = 0.6, maxval = 0.85, step = 0.005, group = G_FIB)
+showFibLines = input.bool(true, "Show fib lines (50 / 62 / 70.5 / 79)", group = G_FIB)
+
+colBull = input.color(color.new(color.lime, 80), "Bullish OTE", group = G_DSP)
+colBear = input.color(color.new(color.red,  80), "Bearish OTE", group = G_DSP)
+colSweet = input.color(color.new(color.yellow, 0), "Sweet spot line", group = G_DSP)
+showLabels = input.bool(true, "Show labels", group = G_DSP)
+
+alertTouch  = input.bool(true, "Alert on price touching OTE", group = G_ALR)
+alertSweet  = input.bool(true, "Alert on price touching sweet spot", group = G_ALR)
+alertInval  = input.bool(true, "Alert on OTE invalidation", group = G_ALR)
+
+// =============================================================================
+// SWING DETECTION
+// =============================================================================
+
+f_isPH(simple int lb) =>
+    bool ok = true
+    for i = 0 to lb * 2
+        if i != lb and high[i] > high[lb]
+            ok := false
+            break
+    ok
+
+f_isPL(simple int lb) =>
+    bool ok = true
+    for i = 0 to lb * 2
+        if i != lb and low[i] < low[lb]
+            ok := false
+            break
+    ok
+
+// =============================================================================
+// LEG TYPE
+// =============================================================================
+
+type Leg
+    float topPx
+    float botPx
+    int   topBar
+    int   botBar
+    bool  bullish
+    box   bx
+    line  sweetLn
+    line  fib50Ln
+    line  fib62Ln
+    line  fib79Ln
+    label lbl
+    bool  invalidated
+
+var array<Leg> legs = array.new<Leg>()
+var float lastSwingHigh = na
+var int   lastSwingHighBar = na
+var float lastSwingLow  = na
+var int   lastSwingLowBar = na
+
+atrV = ta.atr(14)
+
+// =============================================================================
+// LEG CONSTRUCTION
+// =============================================================================
+
+f_buildLeg(bool bull, float top, int topBar, float bot, int botBar) =>
+    float legSize = top - bot
+    bool ok = useImpulseFilter ? legSize >= minLegATR * atrV : legSize > 0
+    Leg out = na
+    if ok
+        float oteHi = top - fibLow  * legSize
+        float oteLo = top - fibHigh * legSize
+        float sweet = top - fibSweet * legSize
+        float f50   = top - 0.5 * legSize
+        float f62   = top - 0.62 * legSize
+        float f79   = top - 0.79 * legSize
+        // For bullish leg (swept low → impulse up): OTE for retracement is between fibLow and fibHigh
+        // applied symmetrically (price expected to retrace down from top).
+        // For bearish leg (swept high → impulse down): mirror — fib applied from bot upward.
+        float boxTop = bull ? oteHi : (bot + fibHigh * legSize)
+        float boxBot = bull ? oteLo : (bot + fibLow  * legSize)
+        float sweetPx = bull ? sweet : (bot + fibSweet * legSize)
+        float f50Px   = bull ? f50   : (bot + 0.5  * legSize)
+        float f62Px   = bull ? f62   : (bot + 0.62 * legSize)
+        float f79Px   = bull ? f79   : (bot + 0.79 * legSize)
+        color clr = bull ? colBull : colBear
+        box bx = box.new(math.max(topBar, botBar), boxTop,
+             bar_index, boxBot,
+             bgcolor = clr,
+             border_color = color.new(color.gray, 60),
+             border_width = 1,
+             extend = extend.right)
+        line sw = line.new(math.max(topBar, botBar), sweetPx,
+             bar_index, sweetPx,
+             color = colSweet, width = 2, extend = extend.right)
+        line lf50 = na
+        line lf62 = na
+        line lf79 = na
+        if showFibLines
+            lf50 := line.new(math.max(topBar, botBar), f50Px,
+                 bar_index, f50Px,
+                 color = color.new(color.gray, 40), style = line.style_dotted,
+                 extend = extend.right)
+            lf62 := line.new(math.max(topBar, botBar), f62Px,
+                 bar_index, f62Px,
+                 color = color.new(color.aqua, 40), style = line.style_dashed,
+                 extend = extend.right)
+            lf79 := line.new(math.max(topBar, botBar), f79Px,
+                 bar_index, f79Px,
+                 color = color.new(color.aqua, 40), style = line.style_dashed,
+                 extend = extend.right)
+        label lb = na
+        if showLabels
+            lb := label.new(bar_index, sweetPx,
+                 bull ? "OTE↑ 70.5%" : "OTE↓ 70.5%",
+                 style = bull ? label.style_label_left : label.style_label_left,
+                 color = color.new(clr, 0),
+                 textcolor = color.white,
+                 size = size.small)
+        out := Leg.new(top, bot, topBar, botBar, bull, bx, sw, lf50, lf62, lf79, lb, false)
+    out
+
+f_pushLeg(Leg lg) =>
+    if not na(lg)
+        array.push(legs, lg)
+        while array.size(legs) > maxLegs
+            Leg old = array.shift(legs)
+            box.delete(old.bx)
+            line.delete(old.sweetLn)
+            if not na(old.fib50Ln)
+                line.delete(old.fib50Ln)
+            if not na(old.fib62Ln)
+                line.delete(old.fib62Ln)
+            if not na(old.fib79Ln)
+                line.delete(old.fib79Ln)
+            if not na(old.lbl)
+                label.delete(old.lbl)
+
+// =============================================================================
+// LEG TRACKING
+// =============================================================================
+
+if barstate.isconfirmed
+    if f_isPH(swingLB)
+        float pH = high[swingLB]
+        int   bH = bar_index - swingLB
+        if not na(lastSwingLow) and pH > lastSwingLow
+            // bullish leg: swingLow → swingHigh
+            Leg lg = f_buildLeg(true, pH, bH, lastSwingLow, lastSwingLowBar)
+            f_pushLeg(lg)
+        lastSwingHigh := pH
+        lastSwingHighBar := bH
+    if f_isPL(swingLB)
+        float pL = low[swingLB]
+        int   bL = bar_index - swingLB
+        if not na(lastSwingHigh) and pL < lastSwingHigh
+            // bearish leg: swingHigh → swingLow
+            Leg lg = f_buildLeg(false, lastSwingHigh, lastSwingHighBar, pL, bL)
+            f_pushLeg(lg)
+        lastSwingLow := pL
+        lastSwingLowBar := bL
+
+// =============================================================================
+// TOUCH / SWEET / INVALIDATION DETECTION
+// =============================================================================
+
+var bool touchAny = false
+var bool sweetAny = false
+var bool invalAny = false
+touchAny := false
+sweetAny := false
+invalAny := false
+
+if array.size(legs) > 0
+    for k = 0 to array.size(legs) - 1
+        Leg lg = array.get(legs, k)
+        if lg.invalidated
+            continue
+        float boxTop = box.get_top(lg.bx)
+        float boxBot = box.get_bottom(lg.bx)
+        float sweetPx = line.get_y1(lg.sweetLn)
+        // Touch
+        bool inZone = low <= boxTop and high >= boxBot
+        if inZone
+            touchAny := true
+        // Sweet
+        bool hitSweet = low <= sweetPx and high >= sweetPx
+        if hitSweet
+            sweetAny := true
+        // Invalidation: bullish OTE invalidated if low < botPx; bearish if high > topPx
+        bool inval = lg.bullish ? low < lg.botPx : high > lg.topPx
+        if inval
+            lg.invalidated := true
+            invalAny := true
+            box.set_bgcolor(lg.bx, color.new(color.gray, 80))
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+
+alertcondition(touchAny  and alertTouch, title = "OTE: Price entered OTE zone",
+     message = "ICT-OTE: Price entered OTE zone on {{ticker}} {{interval}} @ {{close}}")
+alertcondition(sweetAny  and alertSweet, title = "OTE: Sweet spot touched (70.5%)",
+     message = "ICT-OTE: Sweet spot 70.5% touched on {{ticker}} {{interval}} @ {{close}}")
+alertcondition(invalAny  and alertInval, title = "OTE: Zone invalidated",
+     message = "ICT-OTE: OTE zone invalidated on {{ticker}} {{interval}} @ {{close}}")
+
+// =============================================================================
+// HIDDEN PLOTS — for cross-module binding
+// =============================================================================
+
+plot(touchAny ? 1 : 0, title = "ICT-OTE: inOTEFlag",
+     display = display.data_window, color = color.new(color.aqua, 100))
+plot(sweetAny ? 1 : 0, title = "ICT-OTE: sweetFlag",
+     display = display.data_window, color = color.new(color.yellow, 100))

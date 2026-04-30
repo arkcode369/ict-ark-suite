@@ -1,0 +1,199 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | Modul 12 — Liquidity Void / Vacuum Block Detector
+// -----------------------------------------------------------------------------
+// File:        indicators/12_liquidity_void.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concept:     docs/concepts/concept-logic.md (Liquidity Void / Vacuum Block)
+//              Strong displacement candle that leaves price gap with minimal wick;
+//              expected to be partially/fully retraced.
+//
+// Logic:
+//   Single-bar void (Vacuum Block):
+//     - body size >= minBodyATR × ATR14
+//     - body / range >= bodyToRangeMin (i.e. wick is tiny)
+//   Multi-bar void (Liquidity Void):
+//     - 3 consecutive same-direction candles forming continuous displacement
+//     - aggregate body >= aggBodyATR × ATR14 with no overlap between candles
+//
+// Box drawn from candle open (start) to close (end) extended right until
+// price retraces partially (50 %) or fully (100 % = mitigated).
+//
+// Limits: max 30 voids (FIFO).
+// =============================================================================
+
+indicator(
+     "ICT/SMC Suite | Liquidity Void",
+     shorttitle = "ICT-VOID",
+     overlay = true,
+     max_boxes_count = 100,
+     max_lines_count = 100,
+     max_labels_count = 200
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_DET = "Detection"
+G_DSP = "Display"
+G_ALR = "Alerts"
+
+useSingleBar = input.bool(true, "Detect single-bar Vacuum Blocks", group = G_DET)
+useMultiBar  = input.bool(true, "Detect 3-bar Liquidity Voids",   group = G_DET)
+minBodyATR     = input.float(1.5, "Single-bar min body (× ATR14)",
+                             minval = 0.5, step = 0.1, group = G_DET)
+bodyToRangeMin = input.float(0.7, "Single-bar body/range floor",
+                             minval = 0.5, maxval = 1.0, step = 0.05, group = G_DET)
+aggBodyATR     = input.float(2.5, "3-bar aggregate min body (× ATR14)",
+                             minval = 1.0, step = 0.1, group = G_DET)
+maxVoids       = input.int(30,  "Max voids tracked (FIFO)",
+                           minval = 5, maxval = 100, group = G_DET)
+
+colBull = input.color(color.new(color.lime, 75), "Bullish void", group = G_DSP)
+colBear = input.color(color.new(color.red,  75), "Bearish void", group = G_DSP)
+colMid  = input.color(color.new(color.yellow, 30), "50 % mid", group = G_DSP)
+colMit  = input.color(color.new(color.gray, 80), "Mitigated", group = G_DSP)
+showMid = input.bool(true,  "Show 50 % mid line", group = G_DSP)
+showLbl = input.bool(true,  "Show labels", group = G_DSP)
+
+alertNew  = input.bool(true, "Alert on new void formed", group = G_ALR)
+alertHalf = input.bool(true, "Alert on void 50 % retraced", group = G_ALR)
+alertFull = input.bool(true, "Alert on void fully mitigated", group = G_ALR)
+
+// =============================================================================
+// TYPE
+// =============================================================================
+
+type Void
+    float top
+    float bot
+    bool  bullish
+    int   startBar
+    box   bx
+    line  midLn
+    label lbl
+    bool  half
+    bool  full
+
+var array<Void> voids = array.new<Void>()
+
+atrV = ta.atr(14)
+
+// =============================================================================
+// PUSH/PRUNE
+// =============================================================================
+
+f_addVoid(bool bull, float top, float bot, int sb) =>
+    color clr = bull ? colBull : colBear
+    box bx = box.new(sb, top, bar_index, bot,
+         bgcolor = clr,
+         border_color = color.new(color.gray, 60),
+         border_width = 1,
+         extend = extend.right)
+    line ml = na
+    if showMid
+        ml := line.new(sb, math.avg(top, bot),
+             bar_index, math.avg(top, bot),
+             color = colMid, style = line.style_dashed, extend = extend.right)
+    label lb = na
+    if showLbl
+        lb := label.new(sb, bull ? bot : top,
+             bull ? "VOID↑" : "VOID↓",
+             style = bull ? label.style_label_up : label.style_label_down,
+             color = color.new(clr, 30),
+             textcolor = color.white,
+             size = size.tiny)
+    Void v = Void.new(top, bot, bull, sb, bx, ml, lb, false, false)
+    array.push(voids, v)
+    while array.size(voids) > maxVoids
+        Void old = array.shift(voids)
+        box.delete(old.bx)
+        if not na(old.midLn)
+            line.delete(old.midLn)
+        if not na(old.lbl)
+            label.delete(old.lbl)
+
+// =============================================================================
+// SINGLE-BAR DETECTION
+// =============================================================================
+
+var bool newVoid = false
+newVoid := false
+
+if barstate.isconfirmed and useSingleBar
+    float body = math.abs(close - open)
+    float rng  = high - low
+    if body >= minBodyATR * atrV and rng > 0 and (body / rng) >= bodyToRangeMin
+        bool bull = close > open
+        f_addVoid(bull, math.max(open, close), math.min(open, close), bar_index)
+        newVoid := true
+
+// =============================================================================
+// 3-BAR DETECTION
+// =============================================================================
+
+if barstate.isconfirmed and useMultiBar
+    bool allBull = close > open and close[1] > open[1] and close[2] > open[2]
+    bool allBear = close < open and close[1] < open[1] and close[2] < open[2]
+    float aggBody = (close - open) + (close[1] - open[1]) + (close[2] - open[2])
+    bool stairBull = allBull and low[1] >= low[2] and low >= low[1]
+    bool stairBear = allBear and high[1] <= high[2] and high <= high[1]
+    if stairBull and aggBody >= aggBodyATR * atrV
+        f_addVoid(true,  close, open[2], bar_index - 2)
+        newVoid := true
+    if stairBear and -aggBody >= aggBodyATR * atrV
+        f_addVoid(false, open[2], close, bar_index - 2)
+        newVoid := true
+
+// =============================================================================
+// MITIGATION TRACKING
+// =============================================================================
+
+var bool halfHit = false
+var bool fullHit = false
+halfHit := false
+fullHit := false
+
+if array.size(voids) > 0
+    for k = 0 to array.size(voids) - 1
+        Void v = array.get(voids, k)
+        if v.full
+            continue
+        float mid = math.avg(v.top, v.bot)
+        // Half mitigation
+        bool reachedMid = v.bullish ? low <= mid : high >= mid
+        if reachedMid and not v.half
+            v.half := true
+            halfHit := true
+        // Full mitigation: opposite side reached
+        bool fullMit = v.bullish ? low <= v.bot : high >= v.top
+        if fullMit and not v.full
+            v.full := true
+            fullHit := true
+            box.set_bgcolor(v.bx, colMit)
+            if not na(v.lbl)
+                label.set_text(v.lbl, "VOID ✓ mitigated")
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+
+alertcondition(newVoid  and alertNew,  title = "VOID: New void formed",
+     message = "ICT-VOID: New void formed on {{ticker}} {{interval}} @ {{close}}")
+alertcondition(halfHit  and alertHalf, title = "VOID: 50% retraced",
+     message = "ICT-VOID: Void 50% retraced on {{ticker}} {{interval}} @ {{close}}")
+alertcondition(fullHit  and alertFull, title = "VOID: Fully mitigated",
+     message = "ICT-VOID: Void fully mitigated on {{ticker}} {{interval}} @ {{close}}")
+
+// =============================================================================
+// HIDDEN PLOTS
+// =============================================================================
+
+plot(newVoid ? 1 : 0, title = "ICT-VOID: newVoidFlag",
+     display = display.data_window, color = color.new(color.aqua, 100))
+plot(halfHit ? 1 : 0, title = "ICT-VOID: halfMitFlag",
+     display = display.data_window, color = color.new(color.yellow, 100))
+plot(fullHit ? 1 : 0, title = "ICT-VOID: fullMitFlag",
+     display = display.data_window, color = color.new(color.gray, 100))
