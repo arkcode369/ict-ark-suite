@@ -1,6 +1,6 @@
 # Roadmap — ICT/SMC Suite
 
-> Pemetaan terperinci konsep → modul → fitur. Status awal April 2026.
+> Pemetaan terperinci konsep → modul → fitur. Status terkini April 2026.
 
 ## Pemetaan Konsep ke Modul
 
@@ -16,33 +16,49 @@
 | `07_msnr.pine` | Malaysian SNR (body-based: Classical/Breakout/GAP), Fresh/Unfresh, Touch & Miss, Engulfing, QML/HNS, Trendline, Storyline, Roadblocks (`concept-snr.md`) |
 | `08_stdv_projections.pine` | Standard Deviations dari range (CBDR/Asia/London/Daily/Q1), Devil's Mark, MMBM/MMSM curve, ABC/123 (`concept-monsterlab.md`, `concept-ipda-mmxm.md`, `concept-crt.md`, `concept-foundation-model.md`, `concept-quarterly-theory.md`) |
 | `09_dashboard.pine` | Top-down narrative & checklist real-time (HTF bias, DOL, Phase IPDA, Setup score) — orkestrator semua modul |
+| `10_ssmt.pine` | Sequential SMT — multi-asset divergence (chart vs ES/NQ/YM atau forex triad) |
 
 ## Tier Rilis
 
-### MVP v0.1 — Tier 1 (Core)
-Fokus: building blocks + structure + waktu. Cukup untuk standalone analysis.
+### v0.1 — Core 9 modul (RILIS)
 - [x] Repo scaffold + library skeleton + concept docs
-- [ ] `library/ictlib.pine` — full helper set
-- [ ] `01_pd_arrays.pine` — FVG, OB, Breaker, Mitigation
-- [ ] `02_liquidity.pine` — Equal H/L, BSL/SSL, Liquidity Sweep, Inducement (LIT) Major/Medium/Minor
-- [ ] `03_market_structure.pine` — Swing, BOS, MSS, CISD
-- [ ] `04_time_sessions.pine` — Killzones, Macros, Silver Bullet, NWOG/NDOG, CBDR
+- [x] `library/ictlib.pine` — full helper set
+- [x] `01_pd_arrays.pine` — FVG, OB, Breaker, Mitigation
+- [x] `02_liquidity.pine` — Equal H/L, BSL/SSL, Liquidity Sweep, Inducement (LIT)
+- [x] `03_market_structure.pine` — Swing, BOS, MSS, CISD
+- [x] `04_time_sessions.pine` — Killzones, Macros, Silver Bullet, NWOG/NDOG, CBDR, CRT 1/5/9
+- [x] `05_quarterly_theory.pine` — True Opens stack, Q1-Q4 markers
+- [x] `06_crt_po3.pine` — CRT 3-candle, OHLC/OLHC, Wednesday Model
+- [x] `07_msnr.pine` — body-based S/R + Engulfing + QML
+- [x] `08_stdv_projections.pine` — STDV dari range terpilih, Devil's Mark, MMBM/MMSM
+- [x] `09_dashboard.pine` — top-down narrative dashboard
 
-### v0.2 — Tier 2 (HTF & Quarterly)
-- [ ] `05_quarterly_theory.pine` — True Opens stack, Q1-Q4 markers, DFR, STDV ±1/±2/±2.5
-- [ ] `06_crt_po3.pine` — CRT 3-candle highlighter, PO3 AMD overlay, OHLC/OLHC labels
-- [ ] `08_stdv_projections.pine` — STDV dari range terpilih, -4 sampai +4
+### v0.2 — Advanced features (RILIS)
+- [x] DFR (Defining Range) projection levels — di Modul 05
+- [x] Magneto / Doubling Theory — di Modul 05
+- [x] Pi Range projection (HTF Q1) — di Modul 05
+- [x] sSMT (Sequential SMT) multi-asset — Modul 10 baru
+- [x] HNS (Head & Shoulders) full pattern matcher — di Modul 07
+- [x] Multi-trendline auto-fit (body-based) — di Modul 07
+- [x] Storyline + Roadblocks visual — di Modul 07
+- [x] Inter-module communication via hidden plots + `input.source` — Modul 01/02/03/09
+- [x] Backtest hooks (`strategy()` variants) — `strategies/01_pd_strategy.pine`, `strategies/06_crt_strategy.pine`
 
-### v0.3 — Tier 3 (Style & Dashboard)
-- [ ] `07_msnr.pine` — body-based S/R + Engulfing
-- [ ] `09_dashboard.pine` — top-down narrative dashboard
+### v0.3 — Strategy library expansion (RILIS)
+- [x] `strategies/02_liquidity_sweep_strategy.pine` — sweep + reclaim entries
+- [x] `strategies/03_mss_strategy.pine` — MSS continuation/reversal entries
+- [x] `strategies/08_stdv_mean_reversion_strategy.pine` — Devil's Mark mean-reversion
+- [x] `strategies/combo_strategy.pine` — multi-confluence (PD + LIT + MSS + KZ + P/D)
 
-### v0.4+ — Iterations
-- [ ] sSMT detector multi-asset (request.security ke 2 instrument lain dari Triad)
-- [ ] Doubling Theory / Magneto detection
-- [ ] Pi Range projection (Q1 → Q3 prediction)
-- [ ] Backtester wrapper (PineScript strategy version)
-- [ ] Alert templates per setup model
+### v0.4+ — Future iterations
+- [ ] Alert templates per setup model (preset alert presets, JSON webhook templates)
+- [ ] Multi-symbol portfolio backtest harness
+- [ ] Walk-forward / Monte Carlo helper (script-based)
+- [ ] Trade journal export (CSV via labels)
+- [ ] CRT model #1 entry detector + dedicated strategy
+- [ ] PO3 AMD model strategy variant
+- [ ] Liquidity-vacuum / void detector
+- [ ] OTE (Optimal Trade Entry) zone confluence overlay
 
 ## Catatan Implementasi
 

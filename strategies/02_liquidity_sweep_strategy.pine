@@ -1,0 +1,146 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | Liquidity Sweep + Reclaim Strategy
+// -----------------------------------------------------------------------------
+// File:        strategies/02_liquidity_sweep_strategy.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concept:     docs/concepts/concept-lit.md (Liquidity / Inducement)
+//              docs/concepts/concept-turtle-soup.md (Stop-run reversal)
+//
+// Setup:
+//   Bullish sweep (long):
+//     - Wick of recent N-bar low taken (low < lowest(low, lookback)[1]) AND
+//     - Close back above that prior low (reclaim).
+//   Entry: next bar open
+//   SL:    sweep low - slBuf × ATR
+//   TP:    Multi-tier — TP1 at +rrTP1 × risk, TP2 at +rrTP2 × risk
+//   Optional: BE move after TP1 hit.
+//
+//   Bearish sweep (short): mirror.
+// =============================================================================
+
+strategy(
+     "ICT/SMC Suite | Sweep+Reclaim Strategy",
+     shorttitle = "ICT-SWEEP-STRAT",
+     overlay = true,
+     pyramiding = 0,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 1,
+     initial_capital = 10000,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.04
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_DET  = "Sweep Detection"
+G_FILT = "Filters"
+G_RISK = "Risk / Targets"
+G_TIME = "Date Range"
+
+lookback = input.int(20, "Sweep lookback bars",
+                     minval = 5, maxval = 200, group = G_DET)
+minWick  = input.float(0.2, "Min wick beyond level (× ATR)",
+                       minval = 0.0, maxval = 5.0, step = 0.05, group = G_DET)
+
+useBiasFilter = input.bool(false, "Require HTF bias agreement", group = G_FILT)
+htfRes        = input.timeframe("240", "HTF resolution",
+                                options = ["60", "240", "D"], group = G_FILT)
+emaLen        = input.int(20, "HTF EMA length", group = G_FILT)
+useSession    = input.bool(true, "Restrict to NY-tz session", group = G_FILT)
+sessStr       = input.session("0700-1600",
+                              "Allowed entry session (NY tz)",
+                              group = G_FILT)
+
+slBuf  = input.float(0.2, "SL buffer (× ATR14 beyond sweep extreme)",
+                     minval = 0.0, maxval = 5.0, step = 0.05, group = G_RISK)
+rrTP1  = input.float(1.0, "TP1 (× risk)",
+                     minval = 0.3, maxval = 10.0, step = 0.1, group = G_RISK)
+rrTP2  = input.float(2.5, "TP2 (× risk)",
+                     minval = 0.5, maxval = 20.0, step = 0.1, group = G_RISK)
+tp1Pct = input.float(50, "TP1 close %", minval = 10, maxval = 100, group = G_RISK)
+moveBE = input.bool(true, "Move SL to BE after TP1", group = G_RISK)
+
+startDate = input.time(timestamp("01 Jan 2020 00:00"), "Backtest start", group = G_TIME)
+endDate   = input.time(timestamp("31 Dec 2099 00:00"), "Backtest end",   group = G_TIME)
+inDate    = time >= startDate and time <= endDate
+
+// =============================================================================
+// FILTERS / SIGNALS
+// =============================================================================
+
+inSess = useSession ?
+     not na(time(timeframe.period, sessStr + ":23456", "America/New_York")) : true
+htfEMA = request.security(syminfo.tickerid, htfRes,
+     ta.ema(close, emaLen),
+     lookahead = barmerge.lookahead_off)
+biasUp   = useBiasFilter ? close > htfEMA : true
+biasDown = useBiasFilter ? close < htfEMA : true
+
+atrV    = ta.atr(14)
+priorHi = ta.highest(high, lookback)[1]
+priorLo = ta.lowest(low,  lookback)[1]
+
+bullSweep = barstate.isconfirmed and low < priorLo and
+            (priorLo - low) >= minWick * atrV and close > priorLo
+bearSweep = barstate.isconfirmed and high > priorHi and
+            (high - priorHi) >= minWick * atrV and close < priorHi
+
+longCond  = bullSweep and biasUp   and inSess and inDate
+shortCond = bearSweep and biasDown and inSess and inDate
+
+// =============================================================================
+// ENTRIES + MULTI-TARGET
+// =============================================================================
+
+var float entryPx   = na
+var float slPx      = na
+var float tp1Px     = na
+var float tp2Px     = na
+var bool  tp1Hit    = false
+
+if longCond and strategy.position_size <= 0
+    float swLow = low
+    float sl    = swLow - slBuf * atrV
+    float ent   = close
+    float risk  = ent - sl
+    if risk > 0
+        entryPx := ent
+        slPx    := sl
+        tp1Px   := ent + rrTP1 * risk
+        tp2Px   := ent + rrTP2 * risk
+        tp1Hit  := false
+        strategy.entry("L", strategy.long)
+        strategy.exit("X1", from_entry = "L", stop = slPx, limit = tp1Px,
+             qty_percent = tp1Pct)
+        strategy.exit("X2", from_entry = "L", stop = slPx, limit = tp2Px)
+
+if shortCond and strategy.position_size >= 0
+    float swHi  = high
+    float sl    = swHi + slBuf * atrV
+    float ent   = close
+    float risk  = sl - ent
+    if risk > 0
+        entryPx := ent
+        slPx    := sl
+        tp1Px   := ent - rrTP1 * risk
+        tp2Px   := ent - rrTP2 * risk
+        tp1Hit  := false
+        strategy.entry("S", strategy.short)
+        strategy.exit("X1", from_entry = "S", stop = slPx, limit = tp1Px,
+             qty_percent = tp1Pct)
+        strategy.exit("X2", from_entry = "S", stop = slPx, limit = tp2Px)
+
+// Move SL to BE after TP1 hit
+if moveBE and strategy.position_size != 0 and not tp1Hit
+    bool hit = strategy.position_size > 0 ? high >= tp1Px : low <= tp1Px
+    if hit
+        tp1Hit := true
+        strategy.exit("X2", from_entry = strategy.position_size > 0 ? "L" : "S",
+             stop = entryPx, limit = tp2Px)
+
+if strategy.position_size == 0
+    tp1Hit := false

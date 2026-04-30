@@ -1,0 +1,247 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | Combo Multi-Confluence Strategy
+// -----------------------------------------------------------------------------
+// File:        strategies/combo_strategy.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concept:     Top-down stack — PD (FVG/OB) + LIT sweep + MSS + Killzone +
+//              Premium/Discount.
+//
+// Setup (long, mirror for short):
+//   Score points (require confluenceMin to fire):
+//     +1 if HTF bias up
+//     +1 if in killzone
+//     +1 if recent bull FVG (last fvgLB bars)
+//     +1 if recent SSL sweep (last sweepLB bars)
+//     +1 if MSS bullish (last mssLB bars)
+//     +1 if price in discount of prev-day range
+//     +1 if ATR > minATR
+//
+//   Entry on next bar after current bar's signal score >= confluenceMin
+//   AND is bullish-leaning (long).
+//
+//   SL: recent swing low - ATR buffer.
+//   TP: 2-tier R:R-based with optional BE move.
+// =============================================================================
+
+strategy(
+     "ICT/SMC Suite | Combo Strategy",
+     shorttitle = "ICT-COMBO",
+     overlay = true,
+     pyramiding = 0,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 1,
+     initial_capital = 10000,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.04
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_CONF = "Confluence"
+G_RISK = "Risk / Targets"
+G_TIME = "Date Range"
+
+confluenceMin = input.int(4, "Min confluence score (1-7)",
+                          minval = 1, maxval = 7, group = G_CONF)
+fvgLB    = input.int(10, "FVG lookback bars",  minval = 1, maxval = 50, group = G_CONF)
+sweepLB  = input.int(15, "Sweep lookback bars", minval = 1, maxval = 50, group = G_CONF)
+mssLB    = input.int(20, "MSS lookback bars",  minval = 1, maxval = 100, group = G_CONF)
+swingLB  = input.int(5,  "Swing fractal half-width", minval = 2, maxval = 20, group = G_CONF)
+minATR   = input.float(0.0, "Min ATR14 to trade", minval = 0.0, group = G_CONF)
+htfRes   = input.timeframe("D", "HTF resolution",
+                           options = ["240", "D", "W"], group = G_CONF)
+
+slBuf  = input.float(0.3, "SL buffer (× ATR14)", group = G_RISK)
+rrTP1  = input.float(1.0, "TP1 (× risk)", group = G_RISK)
+rrTP2  = input.float(3.0, "TP2 (× risk)", group = G_RISK)
+tp1Pct = input.float(50, "TP1 close %", group = G_RISK)
+moveBE = input.bool(true, "Move SL to BE after TP1", group = G_RISK)
+
+startDate = input.time(timestamp("01 Jan 2020 00:00"), "Backtest start", group = G_TIME)
+endDate   = input.time(timestamp("31 Dec 2099 00:00"), "Backtest end",   group = G_TIME)
+inDate    = time >= startDate and time <= endDate
+
+// =============================================================================
+// SIGNALS (compute each in isolation, score them)
+// =============================================================================
+
+atrV = ta.atr(14)
+
+// HTF bias
+htfEMA = request.security(syminfo.tickerid, htfRes,
+     ta.ema(close, 20),
+     lookahead = barmerge.lookahead_off)
+biasUp   = close > htfEMA
+biasDown = close < htfEMA
+
+// Killzone (London or NY AM or NY PM)
+inKZ = not na(time(timeframe.period, "0200-0500:23456", "America/New_York")) or
+       not na(time(timeframe.period, "0700-1000:23456", "America/New_York")) or
+       not na(time(timeframe.period, "1330-1600:23456", "America/New_York"))
+
+// Recent FVG
+bullFvgRecent = false
+bearFvgRecent = false
+for i = 0 to math.min(fvgLB, bar_index)
+    if low[i] > high[i + 2]
+        bullFvgRecent := true
+    if high[i] < low[i + 2]
+        bearFvgRecent := true
+
+// Recent sweep (price wicked beyond N-bar extremes then closed back)
+bullSweepRecent = false
+bearSweepRecent = false
+for i = 0 to math.min(sweepLB, bar_index - 5)
+    float pH = ta.highest(high, 10)[i + 1]
+    float pL = ta.lowest(low, 10)[i + 1]
+    if low[i] < pL and close[i] > pL
+        bullSweepRecent := true
+    if high[i] > pH and close[i] < pH
+        bearSweepRecent := true
+
+// MSS detection (simplified): close break of N-bar high/low
+bullMSSRecent = false
+bearMSSRecent = false
+for i = 0 to math.min(mssLB, bar_index - 10)
+    float prevHi = ta.highest(high, 10)[i + 1]
+    float prevLo = ta.lowest(low, 10)[i + 1]
+    if close[i] > prevHi
+        bullMSSRecent := true
+    if close[i] < prevLo
+        bearMSSRecent := true
+
+// Premium/Discount of prev day
+[dHigh, dLow] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1]],
+     lookahead = barmerge.lookahead_off)
+mid = math.avg(dHigh, dLow)
+inDiscount = close < mid
+inPremium  = close > mid
+
+// =============================================================================
+// SCORE
+// =============================================================================
+
+int longScore = 0
+if biasUp
+    longScore += 1
+if inKZ
+    longScore += 1
+if bullFvgRecent
+    longScore += 1
+if bullSweepRecent
+    longScore += 1
+if bullMSSRecent
+    longScore += 1
+if inDiscount
+    longScore += 1
+if atrV >= minATR
+    longScore += 1
+
+int shortScore = 0
+if biasDown
+    shortScore += 1
+if inKZ
+    shortScore += 1
+if bearFvgRecent
+    shortScore += 1
+if bearSweepRecent
+    shortScore += 1
+if bearMSSRecent
+    shortScore += 1
+if inPremium
+    shortScore += 1
+if atrV >= minATR
+    shortScore += 1
+
+bool longSignal  = barstate.isconfirmed and longScore  >= confluenceMin and inDate
+bool shortSignal = barstate.isconfirmed and shortScore >= confluenceMin and inDate
+
+// =============================================================================
+// SWING-BASED SL
+// =============================================================================
+
+f_isPL2(simple int lb) =>
+    bool ok = true
+    for i = 0 to lb * 2
+        if i != lb and low[i] < low[lb]
+            ok := false
+            break
+    ok
+
+f_isPH2(simple int lb) =>
+    bool ok = true
+    for i = 0 to lb * 2
+        if i != lb and high[i] > high[lb]
+            ok := false
+            break
+    ok
+
+var float lastSwingLow  = na
+var float lastSwingHigh = na
+
+if barstate.isconfirmed
+    if f_isPL2(swingLB)
+        lastSwingLow := low[swingLB]
+    if f_isPH2(swingLB)
+        lastSwingHigh := high[swingLB]
+
+// =============================================================================
+// ENTRIES + MULTI-TARGET
+// =============================================================================
+
+var float entryPx = na
+var float tp1Px   = na
+var float tp2Px   = na
+var bool  tp1Hit  = false
+
+if longSignal and strategy.position_size <= 0 and not na(lastSwingLow)
+    float sl   = lastSwingLow - slBuf * atrV
+    float ent  = close
+    float risk = ent - sl
+    if risk > 0
+        entryPx := ent
+        tp1Px   := ent + rrTP1 * risk
+        tp2Px   := ent + rrTP2 * risk
+        tp1Hit  := false
+        strategy.entry("L-COMBO", strategy.long)
+        strategy.exit("X1", from_entry = "L-COMBO", stop = sl, limit = tp1Px,
+             qty_percent = tp1Pct)
+        strategy.exit("X2", from_entry = "L-COMBO", stop = sl, limit = tp2Px)
+
+if shortSignal and strategy.position_size >= 0 and not na(lastSwingHigh)
+    float sl   = lastSwingHigh + slBuf * atrV
+    float ent  = close
+    float risk = sl - ent
+    if risk > 0
+        entryPx := ent
+        tp1Px   := ent - rrTP1 * risk
+        tp2Px   := ent - rrTP2 * risk
+        tp1Hit  := false
+        strategy.entry("S-COMBO", strategy.short)
+        strategy.exit("X1", from_entry = "S-COMBO", stop = sl, limit = tp1Px,
+             qty_percent = tp1Pct)
+        strategy.exit("X2", from_entry = "S-COMBO", stop = sl, limit = tp2Px)
+
+// BE move after TP1
+if moveBE and strategy.position_size != 0 and not tp1Hit and not na(tp1Px)
+    bool hit = strategy.position_size > 0 ? high >= tp1Px : low <= tp1Px
+    if hit
+        tp1Hit := true
+        strategy.exit("X2",
+             from_entry = strategy.position_size > 0 ? "L-COMBO" : "S-COMBO",
+             stop = entryPx, limit = tp2Px)
+
+if strategy.position_size == 0
+    tp1Hit := false
+
+// =============================================================================
+// VISUAL: confluence score in data window
+// =============================================================================
+
+plot(longScore,  title = "Long score",  display = display.data_window, color = color.lime)
+plot(shortScore, title = "Short score", display = display.data_window, color = color.red)
