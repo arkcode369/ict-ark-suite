@@ -1,0 +1,124 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | STDV Mean-Reversion Strategy (Devil's Mark)
+// -----------------------------------------------------------------------------
+// File:        strategies/08_stdv_mean_reversion_strategy.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concept:     docs/concepts/concept-monsterlab.md (Devil's Mark / STDV)
+//              docs/concepts/concept-foundation-model.md
+//
+// Setup:
+//   Reference range: previous-day H/L (default).
+//   Mid (Devil's Mark) = avg(prevH, prevL).
+//   Half-deviation (HD) = (prevH - prevL) / 2.
+//
+//   Long mean-reversion entry (bullish):
+//     - Price closes < mid - revLevel × HD (below lower band) AND
+//     - Optional bullish reversal candle (close > open).
+//   Exit: TP at mid (Devil's Mark). SL = mid - slLevel × HD.
+//
+//   Short mean-reversion: mirror.
+//
+// Best used in low-volatility / range conditions; avoid in trending markets.
+// =============================================================================
+
+strategy(
+     "ICT/SMC Suite | STDV MR Strategy",
+     shorttitle = "ICT-STDV-MR",
+     overlay = true,
+     pyramiding = 0,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 1,
+     initial_capital = 10000,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.04
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_REF  = "Reference Range"
+G_LEV  = "Levels"
+G_FILT = "Filters"
+G_RISK = "Risk"
+G_TIME = "Date Range"
+
+src = input.string("prev_day", "Reference range",
+                   options = ["prev_day", "rolling_N"], group = G_REF)
+rollingN = input.int(20, "Rolling N (when src=rolling_N)",
+                     minval = 5, maxval = 200, group = G_REF)
+
+revLevel = input.float(1.0,
+                       "Entry trigger (× HD below/above mid)",
+                       minval = 0.3, maxval = 3.0, step = 0.1, group = G_LEV)
+slLevel  = input.float(2.0,
+                       "SL distance (× HD beyond entry side)",
+                       minval = 0.5, maxval = 5.0, step = 0.1, group = G_LEV)
+
+useReversalCandle = input.bool(true, "Require reversal candle confirmation",
+                               group = G_FILT)
+useATRFilter      = input.bool(true,
+                               "Skip when range > maxRangeATR × ATR (too volatile)",
+                               group = G_FILT)
+maxRangeATR       = input.float(3.0, "Max prev range (× ATR14)",
+                               minval = 0.5, maxval = 10.0, step = 0.1, group = G_FILT)
+
+closeAtMid = input.bool(true, "Close position when price reaches mid (Devil's)",
+                        group = G_RISK)
+
+startDate = input.time(timestamp("01 Jan 2020 00:00"), "Backtest start", group = G_TIME)
+endDate   = input.time(timestamp("31 Dec 2099 00:00"), "Backtest end",   group = G_TIME)
+inDate    = time >= startDate and time <= endDate
+
+// =============================================================================
+// REFERENCE RANGE
+// =============================================================================
+
+[prevH, prevL] = src == "prev_day" ?
+     request.security(syminfo.tickerid, "D",
+         [high[1], low[1]],
+         lookahead = barmerge.lookahead_off) :
+     [ta.highest(high, rollingN), ta.lowest(low, rollingN)]
+
+mid = math.avg(prevH, prevL)
+hd  = (prevH - prevL) / 2.0
+upperBand = mid + revLevel * hd
+lowerBand = mid - revLevel * hd
+slLong    = mid - slLevel * hd
+slShort   = mid + slLevel * hd
+
+atrV = ta.atr(14)
+rangeOK = useATRFilter ? (prevH - prevL) <= maxRangeATR * atrV : true
+
+bullCandle = close > open
+bearCandle = close < open
+revOK_L    = useReversalCandle ? bullCandle : true
+revOK_S    = useReversalCandle ? bearCandle : true
+
+longCond  = barstate.isconfirmed and close < lowerBand and revOK_L and rangeOK and inDate
+shortCond = barstate.isconfirmed and close > upperBand and revOK_S and rangeOK and inDate
+
+// =============================================================================
+// ENTRIES
+// =============================================================================
+
+if longCond and strategy.position_size <= 0
+    strategy.entry("L-MR", strategy.long)
+    strategy.exit("X-L", from_entry = "L-MR", stop = slLong,
+         limit = closeAtMid ? mid : na)
+
+if shortCond and strategy.position_size >= 0
+    strategy.entry("S-MR", strategy.short)
+    strategy.exit("X-S", from_entry = "S-MR", stop = slShort,
+         limit = closeAtMid ? mid : na)
+
+// Visual aids
+plot(mid,       title = "Devil's Mark", color = color.yellow, linewidth = 2)
+plot(upperBand, title = "Upper band",   color = color.new(color.red,  40))
+plot(lowerBand, title = "Lower band",   color = color.new(color.lime, 40))
+plot(slLong,    title = "SL Long",      color = color.new(color.red,  60),
+     style = plot.style_circles)
+plot(slShort,   title = "SL Short",     color = color.new(color.red,  60),
+     style = plot.style_circles)

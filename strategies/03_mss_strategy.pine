@@ -1,0 +1,198 @@
+//@version=6
+// =============================================================================
+// ICT/SMC Suite | MSS Continuation Strategy
+// -----------------------------------------------------------------------------
+// File:        strategies/03_mss_strategy.pine
+// Author:      arkcode369 (la51)
+// License:     MIT
+// Concept:     docs/concepts/concept-logic.md (Market Structure Shift)
+//              docs/concepts/concept-foundation-model.md
+//
+// Setup:
+//   Detect MSS = close break of most-recent unbroken swing in opposite trend
+//   direction. Bullish MSS = close > prior swing high while trend was down.
+//   Bearish MSS = close < prior swing low while trend was up.
+//
+//   Entry: next bar open after MSS confirmation.
+//   SL:    most-recent swing low (long) / high (short) - ATR buffer
+//   TP:    multi-target via R:R multiples
+//
+// Trend dir tracked via simple last-MSS state machine.
+// =============================================================================
+
+strategy(
+     "ICT/SMC Suite | MSS Strategy",
+     shorttitle = "ICT-MSS-STRAT",
+     overlay = true,
+     pyramiding = 0,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 1,
+     initial_capital = 10000,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.04
+     )
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+G_SW   = "Swings"
+G_FILT = "Filters"
+G_RISK = "Risk / Targets"
+G_TIME = "Date Range"
+
+swingLB = input.int(5, "Swing lookback (3-bar fractal half-width)",
+                    minval = 2, maxval = 30, group = G_SW)
+maxSw   = input.int(20, "Max swings tracked per side", minval = 5, maxval = 100, group = G_SW)
+
+useSession = input.bool(true, "Restrict to NY-tz session", group = G_FILT)
+sessStr    = input.session("0700-1600",
+                           "Allowed entry session (NY tz)",
+                           group = G_FILT)
+
+slBuf  = input.float(0.3, "SL buffer (× ATR14)",
+                     minval = 0.0, maxval = 5.0, step = 0.05, group = G_RISK)
+rrTP1  = input.float(1.0, "TP1 (× risk)",
+                     minval = 0.3, maxval = 10.0, step = 0.1, group = G_RISK)
+rrTP2  = input.float(2.0, "TP2 (× risk)",
+                     minval = 0.5, maxval = 20.0, step = 0.1, group = G_RISK)
+tp1Pct = input.float(50, "TP1 close %", minval = 10, maxval = 100, group = G_RISK)
+
+startDate = input.time(timestamp("01 Jan 2020 00:00"), "Backtest start", group = G_TIME)
+endDate   = input.time(timestamp("31 Dec 2099 00:00"), "Backtest end",   group = G_TIME)
+inDate    = time >= startDate and time <= endDate
+
+// =============================================================================
+// SWING TRACKING
+// =============================================================================
+
+f_isPH(simple int lb) =>
+    bool ok = true
+    for i = 0 to lb * 2
+        if i != lb and high[i] > high[lb]
+            ok := false
+            break
+    ok
+
+f_isPL(simple int lb) =>
+    bool ok = true
+    for i = 0 to lb * 2
+        if i != lb and low[i] < low[lb]
+            ok := false
+            break
+    ok
+
+type Swing
+    float price
+    int   bar
+    bool  broken
+
+var array<Swing> highs = array.new<Swing>()
+var array<Swing> lows  = array.new<Swing>()
+var int trendDir = 0  // 1 = up, -1 = down, 0 = none
+
+if barstate.isconfirmed
+    if f_isPH(swingLB)
+        array.push(highs, Swing.new(high[swingLB], bar_index - swingLB, false))
+        while array.size(highs) > maxSw
+            array.shift(highs)
+    if f_isPL(swingLB)
+        array.push(lows, Swing.new(low[swingLB], bar_index - swingLB, false))
+        while array.size(lows) > maxSw
+            array.shift(lows)
+
+// =============================================================================
+// MSS DETECTION + ENTRY
+// =============================================================================
+
+inSess = useSession ?
+     not na(time(timeframe.period, sessStr + ":23456", "America/New_York")) : true
+
+var bool bullMSS = false
+var bool bearMSS = false
+var float mssSL  = na
+
+bullMSS := false
+bearMSS := false
+
+if barstate.isconfirmed
+    // Find latest unbroken swing high above current
+    if array.size(highs) > 0
+        for k = 0 to array.size(highs) - 1
+            int idx = array.size(highs) - 1 - k
+            Swing s = array.get(highs, idx)
+            if not s.broken
+                if close > s.price and trendDir <= 0
+                    s.broken := true
+                    bullMSS  := true
+                    trendDir := 1
+                break
+    if array.size(lows) > 0
+        for k = 0 to array.size(lows) - 1
+            int idx = array.size(lows) - 1 - k
+            Swing s = array.get(lows, idx)
+            if not s.broken
+                if close < s.price and trendDir >= 0
+                    s.broken := true
+                    bearMSS  := true
+                    trendDir := -1
+                break
+
+atrV = ta.atr(14)
+
+// Find protective swing for SL
+f_recentSwingLow() =>
+    float p = na
+    if array.size(lows) > 0
+        for k = 0 to array.size(lows) - 1
+            int idx = array.size(lows) - 1 - k
+            Swing s = array.get(lows, idx)
+            p := s.price
+            break
+    p
+
+f_recentSwingHigh() =>
+    float p = na
+    if array.size(highs) > 0
+        for k = 0 to array.size(highs) - 1
+            int idx = array.size(highs) - 1 - k
+            Swing s = array.get(highs, idx)
+            p := s.price
+            break
+    p
+
+var float entryPx = na
+var float tp1Px   = na
+var float tp2Px   = na
+
+if bullMSS and inSess and inDate and strategy.position_size <= 0
+    float swLow = f_recentSwingLow()
+    if not na(swLow)
+        float sl = swLow - slBuf * atrV
+        float ent = close
+        float risk = ent - sl
+        if risk > 0
+            entryPx := ent
+            mssSL   := sl
+            tp1Px   := ent + rrTP1 * risk
+            tp2Px   := ent + rrTP2 * risk
+            strategy.entry("L-MSS", strategy.long)
+            strategy.exit("X1", from_entry = "L-MSS", stop = sl, limit = tp1Px,
+                 qty_percent = tp1Pct)
+            strategy.exit("X2", from_entry = "L-MSS", stop = sl, limit = tp2Px)
+
+if bearMSS and inSess and inDate and strategy.position_size >= 0
+    float swHigh = f_recentSwingHigh()
+    if not na(swHigh)
+        float sl = swHigh + slBuf * atrV
+        float ent = close
+        float risk = sl - ent
+        if risk > 0
+            entryPx := ent
+            mssSL   := sl
+            tp1Px   := ent - rrTP1 * risk
+            tp2Px   := ent - rrTP2 * risk
+            strategy.entry("S-MSS", strategy.short)
+            strategy.exit("X1", from_entry = "S-MSS", stop = sl, limit = tp1Px,
+                 qty_percent = tp1Pct)
+            strategy.exit("X2", from_entry = "S-MSS", stop = sl, limit = tp2Px)
